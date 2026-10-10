@@ -1,0 +1,6 @@
+data/cache/
+runtime/
+node_modules/
+__pycache__/
+*.log
+.env

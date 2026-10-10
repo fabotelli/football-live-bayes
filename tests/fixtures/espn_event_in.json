@@ -1,0 +1,4 @@
+{"id":"401772999","date":"2026-10-11T17:00Z","competitions":[{"status":{"clock":512,"displayClock":"8:32","period":3,"type":{"state":"in","name":"STATUS_IN_PROGRESS","completed":false}},
+"competitors":[{"homeAway":"home","score":"17","team":{"id":"2","abbreviation":"BUF"}},{"homeAway":"away","score":"13","team":{"id":"12","abbreviation":"KC"}}],
+"odds":[{"details":"BUF -2.5","overUnder":47.5}],
+"situation":{"down":3,"distance":4,"possessionText":"KC 42","possession":"12","homeTimeouts":3,"awayTimeouts":2,"isRedZone":false}}]}

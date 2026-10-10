@@ -1,0 +1,17 @@
+{
+  "name": "football-live-bayes",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "NFL + NCAAF live drive-model shadow pipeline for Kalshi (fresh restart, same shape as nhl-live-bayes)",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "build:nfl": "python3 scripts/fetch_nfl.py && python3 scripts/build_nfl.py",
+    "build:ncaaf": "python3 scripts/fetch_ncaaf.py && python3 scripts/build_ncaaf.py",
+    "backtest": "node scripts/backtest.ts",
+    "shadow": "node src/live/shadow.ts"
+  }
+}
