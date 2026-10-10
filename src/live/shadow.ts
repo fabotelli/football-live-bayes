@@ -1,5 +1,5 @@
 // SHADOW poll loop: ESPN game state -> drive model -> fair prices -> compare with Kalshi quotes -> append-only JSONL. NEVER trades.
-// Inputs: ESPN scoreboards (NFL; NCAAF only once data/models/ncaaf_drive_v1.json exists), Kalshi public markets for ENABLED series.
+// Inputs: ESPN scoreboards (NFL; NCAAF only once data/models/ncaaf_drive_v2.json exists), Kalshi public markets for ENABLED series.
 // Outputs: runtime/state/signals-<ETdate>.jsonl (one row per market side per poll) and runtime/state/latest.json.
 //   node src/live/shadow.ts [--once] [--poll 15]
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -22,7 +22,7 @@ const codes = (espn: string) => [espn, ...(ALIASES[espn] ?? [])];
 
 const models: Partial<Record<League, DriveModel>> = {};
 for (const lg of ['NFL', 'NCAAF'] as League[]) {
-  const p = `${root}data/models/${lg.toLowerCase()}_drive_v1.json`;
+  const p = `${root}data/models/${lg.toLowerCase()}_drive_v2.json`;
   if (existsSync(p)) models[lg] = new DriveModel(JSON.parse(readFileSync(p, 'utf8')));
 }
 

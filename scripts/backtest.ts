@@ -1,5 +1,5 @@
 // Holdout backtest of the drive model against real NFL outcomes and against nflverse's own market-anchored WP (vegas_home_wp).
-// Inputs: data/cache/nfl/bt_states.csv.gz (scripts/build_nfl.py), data/models/nfl_drive_v1.json. Never touches the network.
+// Inputs: data/cache/nfl/bt_states.csv.gz (scripts/build_nfl.py), data/models/nfl_drive_v2.json. Never touches the network.
 // Prints log loss / Brier for home-win by game phase, and calibration of P(final total > closing total) from in-game states.
 //   node scripts/backtest.ts [--league nfl|ncaaf] [--sims 1000] [--seasons 2024,2025,2026] [--max 0]
 // The NCAAF benchmark column is cfbfastR's spread-adjusted home_wp_before (stored in the same vegas_home_wp field).
@@ -12,7 +12,7 @@ const SIMS = Number(arg('sims', '1000')), MAX = Number(arg('max', '0'));
 const LEAGUE = arg('league', 'nfl');
 const SEASONS = new Set(arg('seasons', LEAGUE === 'nfl' ? '2024,2025,2026' : '2025,2026').split(',').map(Number));
 const root = new URL('..', import.meta.url).pathname;
-const json = JSON.parse(readFileSync(root + `data/models/${LEAGUE}_drive_v1.json`, 'utf8'));
+const json = JSON.parse(readFileSync(root + `data/models/${LEAGUE}_drive_v2.json`, 'utf8'));
 const csv = gunzipSync(readFileSync(root + `data/cache/${LEAGUE}/bt_states.csv.gz`)).toString('utf8').trim().split('\n');
 const hdr = csv[0].split(','); const ix = (k: string) => hdr.indexOf(k);
 let rows = csv.slice(1).map((l) => l.split(',')).filter((r) => SEASONS.has(Number(r[ix('season')])));

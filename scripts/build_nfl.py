@@ -2,12 +2,16 @@
 """Build the NFL drive-model tables from nflverse play-by-play (data/cache/nfl/pbp_<season>.csv.gz, games.csv).
 
 Outputs
-  data/models/nfl_drive_v1.json   tables the TypeScript engine reads (src/model/drive.ts)
+  data/models/nfl_drive_v2.json   tables the TypeScript engine reads (src/model/drive.ts)
   data/cache/nfl/bt_states.csv.gz sampled in-game states from the holdout seasons, for scripts/backtest.ts
 
 Model pieces (all empirical, fitted on TRAIN seasons only; holdout seasons are never used for tables except kickoff start position,
 which is per-season because the kickoff rules changed in 2024 and 2025):
-  outcome  P(drive result | half-time bucket, late-game score bucket, yards-to-goal bin, down, to-go bin), hierarchically smoothed
+  outcome  P(drive result | half-clock bucket, half x score-gap bucket, yards-to-goal bin, down, to-go bin), hierarchically smoothed
+  strength mean pregame strength r of the offenses behind each outcome cell (r = market-implied points / league average). Cells
+           conditioned on the score gap are dominated by strong teams when leading big and weak ones when trailing big; the engine
+           divides each team's strength by the cell's r so team strength is not counted twice (the cause of the NCAAF late-game
+           over-prediction in drive model v1)
   duration quantiles of the seconds the rest of the drive takes, by (result, time bucket, field zone)
   nextStart where the other team starts after a non-scoring drive end, by (result, yards-to-goal bin of the state)
   kickoff  start-position distribution after a score, per season
@@ -27,10 +31,13 @@ OUTCOMES = ['TD', 'FG', 'PUNT', 'TO', 'DOWNS', 'MISSFG', 'END', 'OPPTD', 'SAFETY
 RESULT_MAP = {'Touchdown': 'TD', 'Field goal': 'FG', 'Punt': 'PUNT', 'Turnover': 'TO', 'Turnover on downs': 'DOWNS',
               'Missed field goal': 'MISSFG', 'End of half': 'END', 'Opp touchdown': 'OPPTD', 'Safety': 'SAFETY'}
 SMOOTH_M = 20.0  # pseudo-count pulling each cell toward its parent cell
+STRENGTH_M = 50.0  # pseudo-count for the per-cell mean offense strength
 
 # Bucket definitions. src/model/drive.ts duplicates these; tests/drive.test.ts checks the two agree on the JSON's `buckets` block.
 TB_EDGES = [30, 120, 300]          # half seconds remaining: <=30 / <=120 / <=300 / >300
-LATE_EDGES = [-9, -1, 0, 8]        # posteam score diff when late in half 2: <=-9 / -8..-1 / 0 / 1..8 / >=9
+GAP_EDGES = [-17, -9, -1, 0, 8, 16]  # posteam score diff: <=-17 / -16..-9 / -8..-1 / 0 / 1..8 / 9..16 / >=17 (both halves)
+N_GAP = len(GAP_EDGES) + 1
+N_HG = 2 * N_GAP                   # half x gap
 TOGO_EDGES = [1, 3, 6, 10]         # to-go: 1 / 2-3 / 4-6 / 7-10 / 11+
 ZONE_EDGES = [20, 60]              # yards to goal: <=20 / 21-60 / 61+
 
@@ -39,10 +46,9 @@ def tb_of(hsr): return np.searchsorted(TB_EDGES, hsr, side='left')            # 
 def ybin_of(y): return np.clip((np.asarray(y) - 1) // 10, 0, 9).astype(int)   # 1-10 -> 0 ... 91-99 -> 9
 def togo_of(t): return np.searchsorted(TOGO_EDGES, t, side='left')            # 0..4
 def zone_of(y): return np.searchsorted(ZONE_EDGES, y, side='left')            # 0..2
-def late_of(half2, tb, diff):
-    # 0 = not late; 1..5 = score-diff bucket in the last 5 minutes of the second half.
-    d = np.searchsorted(LATE_EDGES, diff, side='left') + 1
-    return np.where(half2 & (tb <= 2), d, 0)
+def hg_of(half2, diff):
+    # half x score-gap bucket: 0..6 in half 1, 7..13 in half 2.
+    return np.asarray(half2, dtype=int) * N_GAP + np.searchsorted(GAP_EDGES, diff, side='left')
 
 
 def load(seasons):
@@ -95,7 +101,11 @@ def states(d, dr):
     s = s[s.result.notna()]
     s['y'] = s.yardline_100.astype(int)
     s['tb'] = tb_of(s.half_seconds_remaining.values)
-    s['late'] = late_of((s.game_half == 'Half2').values, s.tb.values, (s.posteam_score - s.defteam_score).values)
+    s['hg'] = hg_of((s.game_half == 'Half2').values, (s.posteam_score - s.defteam_score).values)
+    # Offense strength: market-implied points for the team with the ball, relative to the average team (NaN without a line).
+    sgn = np.where(s.posteam == s.home_team, 1.0, -1.0)
+    implied = (s.total_line + sgn * s.spread_line) / 2
+    s['r'] = implied / (s.groupby('game_id').total_line.first().mean() / 2)
     s['yb'] = ybin_of(s.y.values)
     s['dn'] = s.down.astype(int) - 1
     s['tg'] = togo_of(s.ydstogo.values)
@@ -104,8 +114,26 @@ def states(d, dr):
     return s
 
 
+LEVELS = [(['tb', 'hg', 'yb'], (4, N_HG, 10)), (['tb', 'hg', 'yb', 'dn'], (4, N_HG, 10, 4)), (['tb', 'hg', 'yb', 'dn', 'tg'], (4, N_HG, 10, 4, 5))]
+
+
+def smoothed_strength(s):
+    """Mean offense strength r per outcome cell, each level pulled toward its parent with pseudo-count STRENGTH_M."""
+    x = s[s.r.notna()]
+    def sums(keys, shape):
+        n, v = np.zeros(shape), np.zeros(shape)
+        idx = tuple(x[k].values for k in keys)
+        np.add.at(n, idx, 1); np.add.at(v, idx, x.r.values)
+        return n, v
+    n0, v0 = sums(['yb'], (10,)); p = (v0 + STRENGTH_M) / (n0 + STRENGTH_M)
+    for i, (keys, shape) in enumerate(LEVELS):
+        n, v = sums(keys, shape)
+        p = (v + STRENGTH_M * p[(None, None) if i == 0 else (..., None)]) / (n + STRENGTH_M)
+    return np.round(p, 4)
+
+
 def smoothed_table(s):
-    """P(outcome | tb, late, yb, dn, tg): each level is pulled toward its parent with pseudo-count SMOOTH_M."""
+    """P(outcome | tb, hg, yb, dn, tg): each level is pulled toward its parent with pseudo-count SMOOTH_M."""
     K = len(OUTCOMES)
     oi = s.result.map({o: i for i, o in enumerate(OUTCOMES)}).values
     def counts(keys, shape):
@@ -116,9 +144,10 @@ def smoothed_table(s):
         n = c.sum(-1, keepdims=True)
         return (c + SMOOTH_M * parent) / (n + SMOOTH_M)
     c0 = counts(['yb'], (10,));                         p0 = (c0 + 1) / (c0.sum(-1, keepdims=True) + K)
-    c1 = counts(['tb', 'late', 'yb'], (4, 6, 10));      p1 = blend(c1, p0[None, None])
-    c2 = counts(['tb', 'late', 'yb', 'dn'], (4, 6, 10, 4)); p2 = blend(c2, p1[..., None, :])
-    c3 = counts(['tb', 'late', 'yb', 'dn', 'tg'], (4, 6, 10, 4, 5)); p3 = blend(c3, p2[..., None, :])
+    (k1, s1), (k2, s2), (k3, s3) = LEVELS
+    p1 = blend(counts(k1, s1), p0[None, None])
+    p2 = blend(counts(k2, s2), p1[..., None, :])
+    p3 = blend(counts(k3, s3), p2[..., None, :])
     return np.round(p3, 5), int(len(s))
 
 
@@ -219,10 +248,11 @@ def main():
     s = states(dtr, dr)
     table, n_states = smoothed_table(s)
     model = {
-        'version': 'nfl_drive_v1', 'league': 'NFL', 'trainSeasons': train, 'nStates': n_states, 'nDrives': int(len(dr)),
+        'version': 'nfl_drive_v2', 'league': 'NFL', 'trainSeasons': train, 'nStates': n_states, 'nDrives': int(len(dr)),
         'outcomes': OUTCOMES,
-        'buckets': {'tbEdges': TB_EDGES, 'lateEdges': LATE_EDGES, 'togoEdges': TOGO_EDGES, 'zoneEdges': ZONE_EDGES, 'yBinWidth': 10},
-        'outcome': table.tolist(),                       # [tb][late][yb][down-1][tg][outcome]
+        'buckets': {'tbEdges': TB_EDGES, 'gapEdges': GAP_EDGES, 'togoEdges': TOGO_EDGES, 'zoneEdges': ZONE_EDGES, 'yBinWidth': 10},
+        'outcome': table.tolist(),                       # [tb][half x gap][yb][down-1][tg][outcome]
+        'strength': smoothed_strength(s).tolist(),       # [tb][half x gap][yb][down-1][tg]
         'duration': {**duration_table(s), **duration_table(s[s.groupby(['game_id', 'fixed_drive']).cumcount() == 0], 'S:')},
         'nextStart': next_start_table(s, dr),
         'kickoffStart': kickoff_table(dr_all),
@@ -231,7 +261,7 @@ def main():
         'meanPointsPerGame': round(float(games[(games.game_type == 'REG') & games.season.isin(train)].total.mean()), 3),
     }
     os.makedirs(os.path.join(ROOT, 'data', 'models'), exist_ok=True)
-    with open(os.path.join(ROOT, 'data', 'models', 'nfl_drive_v1.json'), 'w') as f: json.dump(model, f, separators=(',', ':'))
+    with open(os.path.join(ROOT, 'data', 'models', 'nfl_drive_v2.json'), 'w') as f: json.dump(model, f, separators=(',', ':'))
     n, ng = export_bt(d, dr_all, hold, os.path.join(CACHE, 'bt_states.csv.gz'))
     print(f'train {train[0]}-{train[-1]}: {len(dr)} drives, {n_states} states; holdout {hold}: {n} states / {ng} games')
     print('tdPoints', model['tdPoints'], 'ot', {k: model['ot'][k] for k in ('n', 'pTie')})

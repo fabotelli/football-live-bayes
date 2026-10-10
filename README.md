@@ -30,7 +30,7 @@ This project applies the NHL live-Bayes approach (`nhl-live-bayes`) to football:
 | path | what |
 |---|---|
 | `scripts/fetch_nfl.py`, `scripts/fetch_ncaaf.py` | download nflverse / cfbfastR play-by-play into `data/cache/` (public GitHub release assets) |
-| `scripts/build_nfl.py`, `scripts/build_ncaaf.py` | fit drive tables → `data/models/{nfl,ncaaf}_drive_v1.json`; export holdout states for the backtest |
+| `scripts/build_nfl.py`, `scripts/build_ncaaf.py` | fit drive tables → `data/models/{nfl,ncaaf}_drive_v2.json`; export holdout states for the backtest |
 | `src/model/drive.ts` | the engine: market-prior calibration (λ) + seeded Monte Carlo over drives → `SimResult` |
 | `scripts/backtest.ts` | holdout backtest vs real outcomes and vs the benchmark WP (nflverse `vegas_home_wp` / cfbfastR `home_wp_before`) |
 | `src/data/espn.ts` | ESPN scoreboard → `GameState` (fail closed on dead balls, kickoffs, missing field position, OT) |

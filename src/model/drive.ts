@@ -1,10 +1,10 @@
 // Drive-level live model for American football (NFL tables today; NCAAF uses the same engine with its own tables).
-// Inputs: a fitted drive model (data/models/<league>_drive_v1.json, built by scripts/build_nfl.py), a market prior (closing
+// Inputs: a fitted drive model (data/models/<league>_drive_v2.json, built by scripts/build_nfl.py), a market prior (closing
 // spread + total), and the live game state (score, clock, possession, field position, down/distance, timeouts).
 // Output: the distribution of final scores, from which moneyline / spread / total / team-total / 1H fair prices are read.
 //
 // How: Monte Carlo over drives with a seeded RNG (same state -> same answer, so fair prices don't jitter between polls).
-// Each drive draws its result from P(result | half-clock bucket, late-game score bucket, yards to goal, down, to-go), then
+// Each drive draws its result from P(result | half-clock bucket, half x score-gap bucket, yards to goal, down, to-go), then
 // the time it takes, then where the next drive starts. Team strength enters as one multiplier per offense (lambda) on the
 // TD and FG probabilities, solved so that pregame expected points match the market's spread and total. The market sets the
 // prior; the live edge has to come from processing game state better/faster than the book, not from out-handicapping the close.
@@ -16,8 +16,9 @@ const K = OUTCOMES.length;
 
 export interface DriveModelJson {
   version: string; league: string; outcomes: string[];
-  buckets: { tbEdges: number[]; lateEdges: number[]; togoEdges: number[]; zoneEdges: number[]; yBinWidth: number };
-  outcome: number[][][][][][];                        // [tb][late][yb][down-1][tg][outcome]
+  buckets: { tbEdges: number[]; gapEdges: number[]; togoEdges: number[]; zoneEdges: number[]; yBinWidth: number };
+  outcome: number[][][][][][];                        // [tb][half x gap][yb][down-1][tg][outcome]
+  strength: number[][][][][];                         // [tb][half x gap][yb][down-1][tg] mean pregame strength of the offenses in the cell
   duration: Record<string, number[] | null>;          // `${outcome}|${tb}|${zone|*}` (drive in progress) and `S:...` (drive start) -> 21 quantiles of seconds
   nextStart: Record<string, number[]>;                // `${outcome}|${yb}` -> P(next start yard bin)
   kickoffStart: Record<string, number[]>;             // season -> P(start yard bin) after a kickoff
@@ -77,6 +78,8 @@ function toDist(rec: Record<string, number>): { v: number[]; p: number[] } {
 export class DriveModel {
   readonly j: DriveModelJson;
   private probs: Float64Array;
+  private strength: Float64Array;
+  private nGap: number;
   private dur = new Map<string, Float64Array>();
   private next = new Map<string, Float64Array>();
   private kick: Float64Array;
@@ -89,8 +92,11 @@ export class DriveModel {
   constructor(j: DriveModelJson, season?: number) {
     this.j = j;
     if (j.outcomes.join() !== OUTCOMES.join()) throw new Error('drive model outcome order mismatch');
+    this.nGap = j.buckets.gapEdges.length + 1;
+    const cells = 4 * 2 * this.nGap * 10 * 4 * 5;
     this.probs = new Float64Array(j.outcome.flat(5) as number[]);
-    if (this.probs.length !== 4 * 6 * 10 * 4 * 5 * K) throw new Error('drive model outcome table has wrong shape');
+    this.strength = new Float64Array(j.strength.flat(4) as number[]);
+    if (this.probs.length !== cells * K || this.strength.length !== cells) throw new Error('drive model tables have the wrong shape');
     for (const [k, q] of Object.entries(j.duration)) if (q) this.dur.set(k, new Float64Array(q));
     for (const [k, p] of Object.entries(j.nextStart)) this.next.set(k, new Float64Array(p));
     const seasons = Object.keys(j.kickoffStart).map(Number).sort((a, b) => a - b);
@@ -102,15 +108,22 @@ export class DriveModel {
     this.halfSeconds = j.halfSeconds ?? 1800;
   }
 
-  /** P(outcome) for the state, before the strength multiplier. */
-  baseProbs(half: number, hsr: number, diff: number, y: number, down: number, togo: number): Float64Array {
+  private cell(half: number, hsr: number, diff: number, y: number, down: number, togo: number): number {
     const b = this.j.buckets;
     const tb = searchsortedLeft(b.tbEdges, hsr);
-    const late = half === 2 && tb <= 2 ? searchsortedLeft(b.lateEdges, diff) + 1 : 0;
+    const hg = (half === 2 ? this.nGap : 0) + searchsortedLeft(b.gapEdges, diff);
     const yb = clamp(Math.floor((y - 1) / b.yBinWidth), 0, 9);
     const tg = searchsortedLeft(b.togoEdges, togo);
-    const i = ((((tb * 6 + late) * 10 + yb) * 4 + (clamp(down, 1, 4) - 1)) * 5 + tg) * K;
+    return (((tb * 2 * this.nGap + hg) * 10 + yb) * 4 + (clamp(down, 1, 4) - 1)) * 5 + tg;
+  }
+  /** P(outcome) for the state, before the strength multiplier. */
+  baseProbs(half: number, hsr: number, diff: number, y: number, down: number, togo: number): Float64Array {
+    const i = this.cell(half, hsr, diff, y, down, togo) * K;
     return this.probs.subarray(i, i + K);
+  }
+  /** Mean pregame strength of the offenses that produced this cell's frequencies (1 = average team). */
+  cellStrength(half: number, hsr: number, diff: number, y: number, down: number, togo: number): number {
+    return this.strength[this.cell(half, hsr, diff, y, down, togo)];
   }
 
   /** Seconds the rest of the drive takes. `fresh` = the drive is just starting (simulated future drive), else in progress. */
@@ -211,8 +224,11 @@ export class DriveModel {
           const snaps = 5 - down, defTO = possHome ? aTO : hTO;
           if (t <= 40 * Math.max(0, snaps - defTO)) break;
         }
-        const base = this.baseProbs(half, t, diff, y, down, togo);
-        const l = possHome ? lam[0] : lam[1];
+        const c = this.cell(half, t, diff, y, down, togo);
+        const base = this.probs.subarray(c * K, c * K + K);
+        // Strength relative to the offenses this cell was fitted on: a 17-point leader's cell already reflects mostly strong teams,
+        // so multiplying by the full lambda would count team strength twice (v1 over-predicted late NCAAF blowout scoring).
+        const l = (possHome ? lam[0] : lam[1]) / this.strength[c];
         const score = base[TD] + base[FG], scaledScore = Math.min(0.98, l * score);
         const rest = (1 - scaledScore) / Math.max(1e-9, 1 - score);
         for (let i = 0; i < K; i++) p[i] = base[i] * rest;

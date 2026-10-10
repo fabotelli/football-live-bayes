@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DriveModel, mean, pOver, type GameState } from '../src/model/drive.ts';
 
-const json = JSON.parse(readFileSync(new URL('../data/models/nfl_drive_v1.json', import.meta.url), 'utf8'));
+const json = JSON.parse(readFileSync(new URL('../data/models/nfl_drive_v2.json', import.meta.url), 'utf8'));
 const m = new DriveModel(json, 2025);
 const kick: GameState = { half: 1, hsr: 1800, homeScore: 0, awayScore: 0, possHome: true, kickoff: true, y: 75, down: 1, togo: 10, homeTO: 3, awayTO: 3, recv2Home: null };
 
@@ -47,7 +47,7 @@ test('score and possession move win probability the right way', () => {
 });
 
 test('NCAAF tables load and calibrate a big college spread without hitting the lambda bounds', () => {
-  const cfb = new DriveModel(JSON.parse(readFileSync(new URL('../data/models/ncaaf_drive_v1.json', import.meta.url), 'utf8')), 2025);
+  const cfb = new DriveModel(JSON.parse(readFileSync(new URL('../data/models/ncaaf_drive_v2.json', import.meta.url), 'utf8')), 2025);
   assert.equal(cfb.j.ot.pTie, 0);   // college OT never ends tied
   const r = cfb.simulate(kick, { spread: 24.5, total: 58.5 }, { sims: 20000, openingCoinFlip: true });
   let cover = 0; for (const [k, v] of r.margin) if (k > 24.5) cover += v;

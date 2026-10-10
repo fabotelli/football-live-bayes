@@ -5,7 +5,7 @@ Same model pieces and JSON shape as scripts/build_nfl.py (whose table functions 
 college data into nflverse column names. FBS-vs-FBS games only. Default train 2023-2024 (the 2023 clock rule, clock keeps running
 after first downs, changed drive lengths, so older seasons would teach the wrong pace); holdout 2025-2026.
 
-Outputs data/models/ncaaf_drive_v1.json and data/cache/ncaaf/bt_states.csv.gz.
+Outputs data/models/ncaaf_drive_v2.json and data/cache/ncaaf/bt_states.csv.gz.
 Source: github.com/sportsdataverse/sportsdataverse-data releases, tag cfbfastR_cfb_pbp (fetch with scripts/fetch_ncaaf.py).
   python3 scripts/build_ncaaf.py [--train 2023-2024] [--holdout 2025-2026]
 """
@@ -33,7 +33,7 @@ RESULT = {
     'Fumble Recovery (Opponent) Touchdown': 'Opp touchdown', 'Blocked Field Goal Touchdown': 'Opp touchdown', 'Punt Return Touchdown': 'Opp touchdown',
     'Safety': 'Safety', 'Blocked Punt (Safety)': 'Safety', 'Punt (Safety)': 'Safety',
 }
-COLS = ['game_id', 'id_play', 'season', 'week', 'season_type', 'home', 'away', 'home_team_division', 'away_team_division', 'pos_team', 'def_pos_team',
+COLS = ['game_id', 'id_play', 'game_play_number', 'season', 'week', 'season_type', 'home', 'away', 'home_team_division', 'away_team_division', 'pos_team', 'def_pos_team',
         'period', 'clock_minutes', 'clock_seconds', 'down', 'distance', 'yards_to_goal', 'play_type', 'drive_number', 'drive_result_detailed',
         'pos_team_score', 'def_pos_team_score', 'pos_team_timeouts_rem_before', 'def_pos_team_timeouts_rem_before', 'spread', 'over_under', 'home_wp_before']
 
@@ -47,12 +47,19 @@ def load(seasons):
         x = x[(x.home_team_division == 'fbs') & (x.away_team_division == 'fbs')]
         out.append(x)
     x = pd.concat(out, ignore_index=True)
-    x['id_play'] = pd.to_numeric(x.id_play, errors='coerce')
-    x = x.sort_values(['game_id', 'id_play'], kind='stable').reset_index(drop=True)
+    # Play order: period, then game clock (descending), then the source's play number for plays in the same second.
+    # NOT id_play: it is an 18-digit ESPN id stored as float64 in the parquet, so it has lost precision and sorting by it
+    # scrambles plays within a game (drive model v1 did that, which corrupted final scores and drive end times).
+    x['clock_left'] = x.clock_minutes.astype(float) * 60 + x.clock_seconds.astype(float)
+    x['gpn'] = x.game_play_number.fillna(x.groupby('game_id').cumcount())
+    x = x.sort_values(['game_id', 'period', 'clock_left', 'gpn'], ascending=[True, True, False, True], kind='stable').reset_index(drop=True)
     home = x.pos_team == x.home
-    # Scores in this source are post-play; pre-play = previous row's post-play score in the same game.
-    post_h = np.where(home, x.pos_team_score, x.def_pos_team_score).astype(float)
-    post_a = np.where(home, x.def_pos_team_score, x.pos_team_score).astype(float)
+    # Scores in this source are post-play. A few rows carry a stale score (timeouts, penalties logged in the same second as a
+    # touchdown), so take the running maximum: a team's score never goes down. Pre-play = previous row's post-play score.
+    x['h_raw'] = np.where(home, x.pos_team_score, x.def_pos_team_score).astype(float)
+    x['a_raw'] = np.where(home, x.def_pos_team_score, x.pos_team_score).astype(float)
+    post_h = x.groupby('game_id').h_raw.cummax().values
+    post_a = x.groupby('game_id').a_raw.cummax().values
     x['total_home_score'], x['total_away_score'] = post_h, post_a
     pre_h = x.groupby('game_id').total_home_score.shift(1).fillna(0).values
     pre_a = x.groupby('game_id').total_away_score.shift(1).fillna(0).values
@@ -74,7 +81,7 @@ def load(seasons):
         'posteam_score': np.where(home, pre_h, pre_a), 'defteam_score': np.where(home, pre_a, pre_h),
         'posteam_timeouts_remaining': x.pos_team_timeouts_rem_before, 'defteam_timeouts_remaining': x.def_pos_team_timeouts_rem_before,
         'spread_line': -x.spread,          # CFBD: negative = home favoured; model/nflverse: positive = home favoured
-        'total_line': x.over_under, 'vegas_home_wp': x.home_wp_before, 'play_id': x.id_play,
+        'total_line': x.over_under, 'vegas_home_wp': x.home_wp_before, 'play_id': np.arange(len(x)),
     })
     fin = d.groupby('game_id')[['total_home_score', 'total_away_score']].transform('last')
     d['home_score'], d['away_score'] = fin.total_home_score, fin.total_away_score
@@ -115,10 +122,11 @@ def main():
         ko[str(season)] = [round(v, 5) for v in (np.bincount(B.ybin_of(g.next_start_y.values), minlength=10) / len(g)).tolist()]
     g = d[d.season.isin(train) & (d.season_type == 'REG')].groupby('game_id').first()
     model = {
-        'version': 'ncaaf_drive_v1', 'league': 'NCAAF', 'trainSeasons': train, 'nStates': n_states, 'nDrives': int(len(dr)),
+        'version': 'ncaaf_drive_v2', 'league': 'NCAAF', 'trainSeasons': train, 'nStates': n_states, 'nDrives': int(len(dr)),
         'outcomes': B.OUTCOMES,
-        'buckets': {'tbEdges': B.TB_EDGES, 'lateEdges': B.LATE_EDGES, 'togoEdges': B.TOGO_EDGES, 'zoneEdges': B.ZONE_EDGES, 'yBinWidth': 10},
+        'buckets': {'tbEdges': B.TB_EDGES, 'gapEdges': B.GAP_EDGES, 'togoEdges': B.TOGO_EDGES, 'zoneEdges': B.ZONE_EDGES, 'yBinWidth': 10},
         'outcome': table.tolist(),
+        'strength': B.smoothed_strength(s).tolist(),
         'duration': {**B.duration_table(s), **B.duration_table(s[s.groupby(['game_id', 'fixed_drive']).cumcount() == 0], 'S:')},
         'nextStart': B.next_start_table(s, dr),
         'kickoffStart': ko,
@@ -126,7 +134,7 @@ def main():
         'ot': ot_table(d[d.season.isin(train)]),
         'meanPointsPerGame': round(float((g.home_score + g.away_score).mean()), 3),
     }
-    with open(os.path.join(ROOT, 'data', 'models', 'ncaaf_drive_v1.json'), 'w') as f: json.dump(model, f, separators=(',', ':'))
+    with open(os.path.join(ROOT, 'data', 'models', 'ncaaf_drive_v2.json'), 'w') as f: json.dump(model, f, separators=(',', ':'))
     n, ng = B.export_bt(d, dr_all, hold, os.path.join(CACHE, 'bt_states.csv.gz'))
     print(f'train {train}: {len(dr)} drives, {n_states} states, {g.shape[0]} games, mean total {model["meanPointsPerGame"]}; holdout {hold}: {n} states / {ng} games')
     print('tdPoints', model['tdPoints'], 'ot', {k: model['ot'][k] for k in ('n', 'pTie')}, 'kickoff bins', {k: int(np.argmax(v)) for k, v in ko.items()})
