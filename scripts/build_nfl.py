@@ -224,16 +224,28 @@ def ot_table(d, games):
 
 
 def dispersion_targets(d, dr):
-    """Real-data targets for scripts/fit_dispersion.ts: SD of second-half drive counts per game and of second-half points
-    after regressing on the closing total and |spread|, plus a typical prior (median lines) to simulate at."""
-    c2 = dr[dr.half == 'Half2'].groupby('game_id').size()
+    """Real-data targets for scripts/fit_dispersion.ts (all from training seasons, regular season, games with a closing line):
+      h2DrivesSd      SD of second-half drive counts per game
+      h2PointsSd      SD of second-half points after regressing on the closing total and |spread|
+      totalSd         SD of (final total - closing total)
+      meanMinusLine   mean of (final total - closing total); lines are medians, so this measures right skew (validation only)
+      h1h2Slope       slope of second-half on first-half points, both after regressing on the lines (validation only)
+      pointsDisp      E[x^2]/E[x] of points per drive: converts points into effective event counts for the live update
+      typicalPrior    median lines, where the fit simulates"""
+    d = d[d.season_type == 'REG']
+    c2 = dr[(dr.half == 'Half2') & dr.game_id.isin(set(d.game_id))].groupby('game_id').size()
     g = d.groupby('game_id').first()
     h1 = d[d.game_half == 'Half1'].groupby('game_id')[['total_home_score', 'total_away_score']].max().sum(axis=1)
     reg = d[d.game_half != 'Overtime'].groupby('game_id')[['total_home_score', 'total_away_score']].max().sum(axis=1)
-    x = pd.DataFrame({'c2': c2, 'h2': reg - h1, 'tl': g.total_line, 'sp': g.spread_line.abs()}).dropna()
+    x = pd.DataFrame({'c2': c2, 'h1': h1, 'h2': reg - h1, 'fin': g.home_score + g.away_score, 'tl': g.total_line, 'sp': g.spread_line.abs()}).dropna()
     X = np.column_stack([np.ones(len(x)), x.tl, x.sp])
-    res = x.h2 - X @ np.linalg.lstsq(X, x.h2, rcond=None)[0]
-    return {'h2DrivesSd': round(float(x.c2.std()), 3), 'h2PointsSd': round(float(res.std()), 3),
+    resid = lambda y: y - X @ np.linalg.lstsq(X, y, rcond=None)[0]
+    e1, e2 = resid(x.h1), resid(x.h2)
+    pts = dr.pts_for.clip(lower=0); pts = pts[pts <= 8]
+    return {'h2DrivesSd': round(float(x.c2.std()), 3), 'h2PointsSd': round(float(e2.std()), 3),
+            'totalSd': round(float((x.fin - x.tl).std()), 3), 'meanMinusLine': round(float((x.fin - x.tl).mean()), 3),
+            'h1h2Slope': round(float(np.cov(e1, e2)[0, 1] / e1.var()), 4), 'nGames': int(len(x)),
+            'pointsDisp': round(float((pts ** 2).mean() / pts.mean()), 3),
             'typicalPrior': {'spread': round(float(x.sp.median()) * 2) / 2, 'total': round(float(x.tl.median()) * 2) / 2}}
 
 
@@ -288,6 +300,7 @@ def main():
         'meanPointsPerGame': round(float(games[(games.game_type == 'REG') & games.season.isin(train)].total.mean()), 3),
         'targets': dispersion_targets(dtr, dr),
         'durationShrink': 1.0,   # set by scripts/fit_dispersion.ts
+        'gameEnv': {'alpha': 0},  # set by scripts/fit_dispersion.ts (0 = no game-environment effect)
     }
     os.makedirs(os.path.join(ROOT, 'data', 'models'), exist_ok=True)
     with open(os.path.join(ROOT, 'data', 'models', 'nfl_drive_v2.json'), 'w') as f: json.dump(model, f, separators=(',', ':'))

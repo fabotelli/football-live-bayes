@@ -3,7 +3,7 @@
 // remaining total, `rmse` the actual error of its mean (sd > rmse = distribution too wide), and the PIT row is the share of real
 // outcomes in each decile of the predicted distribution (flat = calibrated; humped in the middle = too wide).
 // Reads the same files as scripts/backtest.ts; no network.
-//   node scripts/diag_remaining.ts [--league ncaaf] [--frac 0.15] [--sims 600]
+//   node scripts/diag_remaining.ts [--league ncaaf] [--frac 0.15] [--sims 600] [--alpha N]
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { DriveModel, mean } from '../src/model/drive.ts';
@@ -12,6 +12,7 @@ const arg = (k: string, d: string) => { const i = process.argv.indexOf('--' + k)
 const LEAGUE = arg('league', 'ncaaf'), FRAC = Number(arg('frac', '0.15')), SIMS = Number(arg('sims', '600'));
 const root = new URL('..', import.meta.url).pathname;
 const model = new DriveModel(JSON.parse(readFileSync(root + `data/models/${LEAGUE}_drive_v2.json`, 'utf8')), 2025);
+if (process.argv.includes('--alpha')) model.envAlpha = Number(arg('alpha', '0'));   // try a game-environment strength without refitting
 const csv = gunzipSync(readFileSync(root + `data/cache/${LEAGUE}/bt_states.csv.gz`)).toString('utf8').trim().split('\n');
 const hdr = csv[0].split(','); const ix = (k: string) => hdr.indexOf(k);
 

@@ -61,9 +61,20 @@ test('fitted drive-length dispersion: simulated 2H drive count and points spread
     const j = JSON.parse(readFileSync(new URL(`../data/models/${lg}_drive_v2.json`, import.meta.url), 'utf8'));
     assert.ok(j.durationShrink > 0 && j.durationShrink <= 1, `${lg} durationShrink ${j.durationShrink}`);
     const r = new DriveModel(j).simulate({ half: 2, hsr: 1800, homeScore: 0, awayScore: 0, possHome: true, kickoff: true, y: 75, down: 1, togo: 10, homeTO: 3, awayTO: 3, recv2Home: true },
-      j.targets.typicalPrior, { sims: 20000, seed: 99 });
+      j.targets.typicalPrior, { sims: 20000, seed: 99, env: 'prior' });   // prior: a 0-0 halftime would otherwise read as a low-scoring game
     const mu = mean(r.total); let v = 0; for (let k = 0; k < r.total.length; k++) v += r.total[k] * (k - mu) ** 2;
     assert.ok(r.drives.sd <= j.targets.h2DrivesSd * 1.06, `${lg} drives sd ${r.drives.sd} vs ${j.targets.h2DrivesSd}`);
     assert.ok(Math.abs(Math.sqrt(v) / j.targets.h2PointsSd - 1) < 0.08, `${lg} 2H pts sd ${Math.sqrt(v)} vs ${j.targets.h2PointsSd}`);
   }
+});
+
+test('game environment: live update raises the remaining-points forecast after a high-scoring start and lowers it after a low one', () => {
+  const j = JSON.parse(readFileSync(new URL('../data/models/ncaaf_drive_v2.json', import.meta.url), 'utf8'));
+  const cfb = new DriveModel(j, 2025);
+  assert.ok(cfb.envAlpha > 0, 'NCAAF game-environment effect is fitted on');
+  const pr = { spread: 3.5, total: 55.5 };
+  const at = (hs: number, as: number) => { const r = cfb.simulate({ half: 2, hsr: 1800, homeScore: hs, awayScore: as, possHome: true, kickoff: true, y: 75, down: 1, togo: 10, homeTO: 3, awayTO: 3, recv2Home: true }, pr, { sims: 20000, seed: 5 }); return mean(r.total) - hs - as; };
+  const low = at(7, 3), mid = at(14, 14), high = at(31, 28);
+  assert.ok(low < mid && mid < high, `remaining after 10 / 28 / 59 first-half points: ${low.toFixed(1)} / ${mid.toFixed(1)} / ${high.toFixed(1)}`);
+  assert.ok(high - low < 8, 'the update is a shrunk adjustment, not a projection of first-half pace');
 });

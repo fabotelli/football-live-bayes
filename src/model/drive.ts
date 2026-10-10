@@ -8,6 +8,13 @@
 // the time it takes, then where the next drive starts. Team strength enters as one multiplier per offense (lambda) on the
 // TD and FG probabilities, solved so that pregame expected points match the market's spread and total. The market sets the
 // prior; the live edge has to come from processing game state better/faster than the book, not from out-handicapping the close.
+//
+// Game environment (the Bayesian part): each simulated game also draws a scoring-environment multiplier g ~ Gamma(alpha, alpha)
+// (mean 1) applied to both offenses, because real games scatter around the line more than drive-level noise explains (some games
+// are shootouts) and that scatter is multiplicative, which is what gives totals their right skew. Live, g is drawn from its
+// posterior given the points scored so far vs the points expected so far at this game's line: Gamma(alpha + P/c, alpha + E/c),
+// with c = E[x^2]/E[x] of points per drive turning points into effective event counts. alpha is fitted per league
+// (scripts/fit_dispersion.ts); alpha = 0 switches the effect off.
 
 export const OUTCOMES = ['TD', 'FG', 'PUNT', 'TO', 'DOWNS', 'MISSFG', 'END', 'OPPTD', 'SAFETY'] as const;
 export type Outcome = typeof OUTCOMES[number];
@@ -26,7 +33,8 @@ export interface DriveModelJson {
   ot: { pTie: number; winnerAdd: Record<string, number>; loserAdd: Record<string, number> };
   halfSeconds?: number;                               // 1800 for NFL and NCAAF
   durationShrink?: number;                            // drive-length dispersion factor, fitted by scripts/fit_dispersion.ts (1 = raw tables)
-  targets?: { h2DrivesSd: number; h2PointsSd: number; typicalPrior: Prior };  // real-data targets for the dispersion fit
+  targets?: { h2DrivesSd: number; h2PointsSd: number; totalSd: number; meanMinusLine: number; h1h2Slope: number; pointsDisp: number; typicalPrior: Prior };
+  gameEnv?: { alpha: number };                        // game-environment prior strength (0 = off), fitted by scripts/fit_dispersion.ts
 }
 
 export interface GameState {
@@ -51,6 +59,26 @@ export interface SimResult {
   h1Total: Float64Array | null; // P(first-half total = k) when the state is still in half 1, else null
   lambda: [number, number];
   drives: { mean: number; sd: number };   // simulated drives from the state to the end of regulation (diagnostics)
+  env: { shape: number; rate: number } | null;   // game-environment distribution used (posterior when live), null when off
+  pairs?: { h1: Int16Array; h2: Int16Array };    // per-path first-half / second-half regulation points (opt.pairs, diagnostics)
+}
+
+export type EnvMode = 'posterior' | 'prior' | 'off';
+export interface SimOptions {
+  sims?: number; seed?: number; lambda?: [number, number]; openingCoinFlip?: boolean;
+  env?: EnvMode;       // posterior (default): update g from the score so far; prior: ignore the score (used for fitting); off: g = 1
+  pairs?: boolean;     // collect per-path 1H/2H points
+  curve?: boolean;     // collect the expected cumulative points by elapsed minute (internal, used by lambdas)
+}
+
+/** Standard normal (Box-Muller) and Gamma(shape >= 1, rate 1) via Marsaglia-Tsang, both from the seeded uniform source. */
+function normal(rand: () => number): number { return Math.sqrt(-2 * Math.log(1 - rand())) * Math.cos(2 * Math.PI * rand()); }
+function gamma(shape: number, rand: () => number): number {
+  const d = shape - 1 / 3, c = 1 / Math.sqrt(9 * d);
+  for (;;) {
+    const x = normal(rand), v = (1 + c * x) ** 3;
+    if (v > 0 && Math.log(1 - rand()) < 0.5 * x * x + d - d * v + d * Math.log(v)) return d * v;
+  }
 }
 
 const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
@@ -93,6 +121,10 @@ export class DriveModel {
   private otWin: { v: number[]; p: number[] };
   private otLose: { v: number[]; p: number[] };
   private lamCache = new Map<string, [number, number]>();
+  private curveCache = new Map<string, Float64Array>();   // expected cumulative total points by elapsed minute (61 values)
+  /** Game-environment prior strength (0 = off) and points dispersion. Public so scripts/fit_dispersion.ts can search them. */
+  envAlpha: number;
+  pointsDisp: number;
   readonly halfSeconds: number;
 
   constructor(j: DriveModelJson, season?: number) {
@@ -105,6 +137,8 @@ export class DriveModel {
     if (this.probs.length !== cells * K || this.strength.length !== cells) throw new Error('drive model tables have the wrong shape');
     for (const [k, q] of Object.entries(j.duration)) if (q) { this.dur.set(k, new Float64Array(q)); this.durMean.set(k, q.reduce((s, x) => s + x, 0) / q.length); }
     this.durShrink = j.durationShrink ?? 1;
+    this.envAlpha = j.gameEnv?.alpha ?? 0;
+    this.pointsDisp = j.targets?.pointsDisp ?? 6.3;
     for (const [k, p] of Object.entries(j.nextStart)) this.next.set(k, new Float64Array(p));
     const seasons = Object.keys(j.kickoffStart).map(Number).sort((a, b) => a - b);
     // Kickoff rules changed in 2024 and 2025: use the requested season's start distribution, else the latest season on file.
@@ -170,11 +204,11 @@ export class DriveModel {
     const start: GameState = { half: 1, hsr: this.halfSeconds, homeScore: 0, awayScore: 0, possHome: true, kickoff: true, y: 75, down: 1, togo: 10, homeTO: 3, awayTO: 3, recv2Home: null };
     const bal = (d: Iterable<[number, number]>, line: number) => { let gt = 0, lt = 0; for (const [k, v] of d) { if (k > line) gt += v; else if (k < line) lt += v; } return gt - lt; };
     const evalAB = (a: number, b: number) => {
-      const r = this.simulate(start, prior, { sims, seed: 12345, lambda: [Math.exp(a + b), Math.exp(a - b)], openingCoinFlip: true });
+      const r = this.simulate(start, prior, { sims, seed: 12345, lambda: [Math.exp(a + b), Math.exp(a - b)], openingCoinFlip: true, env: 'prior' });
       return { t: bal(r.total.entries(), prior.total), m: bal(r.margin.entries(), prior.spread), r };
     };
     // Start from the mean-matching guess: one simulation at lambda = 1 gives points per unit lambda for this ruleset.
-    const r0 = this.simulate(start, prior, { sims, seed: 12345, lambda: [1, 1], openingCoinFlip: true });
+    const r0 = this.simulate(start, prior, { sims, seed: 12345, lambda: [1, 1], openingCoinFlip: true, env: 'prior' });
     const base = (mean(r0.home) + mean(r0.away)) / 2;
     let a = Math.log(Math.max(prior.total / 2, 1) / base), b = 0.5 * Math.log(Math.max(prior.total + prior.spread, 2) / Math.max(prior.total - prior.spread, 2));
     // Newton steps with fixed slopes: d(balance)/d(a) and d(balance)/d(b) are both ~2.7 for NFL-like scoring (measured). Secant
@@ -191,16 +225,40 @@ export class DriveModel {
     a = best.a; b = best.b;
     const lam: [number, number] = [clamp(Math.exp(a + b), 0.2, 4), clamp(Math.exp(a - b), 0.2, 4)];
     this.lamCache.set(key, lam);
+    // Expected points so far, by elapsed minute, at this line: the denominator of the live game-environment update.
+    const curve = this.simulate(start, prior, { sims, seed: 4242, lambda: lam, openingCoinFlip: true, env: 'prior', curve: true }).curve!;
+    this.curveCache.set(key, curve);
     return lam;
+  }
+
+  /** Expected total points scored by `elapsed` game seconds (regulation) at this prior's calibrated strengths. */
+  expectedSoFar(prior: Prior, elapsed: number): number {
+    this.lambdas(prior);
+    const c = this.curveCache.get(`${prior.spread}|${prior.total}`)!;
+    const x = clamp(elapsed / 60, 0, c.length - 1), i = Math.floor(x), f = x - i;
+    return i + 1 < c.length ? c[i] * (1 - f) + c[i + 1] * f : c[i];
   }
 
   /** P(home wins OT | tied after regulation, no OT tie): mild lean toward the market favourite (heuristic, unfitted). */
   private pHomeOT(prior: Prior): number { return 0.5 + 0.7 * (normCdf(prior.spread / 13.5) - 0.5); }
 
-  simulate(st: GameState, prior: Prior, opt: { sims?: number; seed?: number; lambda?: [number, number]; openingCoinFlip?: boolean } = {}): SimResult {
+  simulate(st: GameState, prior: Prior, opt: SimOptions & { curve?: boolean } = {}): SimResult & { curve?: Float64Array } {
     const sims = opt.sims ?? 20000;
     const lam = opt.lambda ?? this.lambdas(prior);
     const rand = rng(opt.seed ?? hashState({ st, prior }));
+    // Game-environment distribution for this call: the prior, or (live) the posterior given points so far vs expected so far.
+    const mode: EnvMode = this.envAlpha > 0 ? (opt.env ?? 'posterior') : 'off';
+    let env: { shape: number; rate: number } | null = null;
+    if (mode !== 'off') {
+      env = { shape: this.envAlpha, rate: this.envAlpha };
+      if (mode === 'posterior') {
+        const elapsed = (st.half - 1) * this.halfSeconds + (this.halfSeconds - st.hsr);
+        env.shape += (st.homeScore + st.awayScore) / this.pointsDisp;
+        env.rate += this.expectedSoFar(prior, elapsed) / this.pointsDisp;
+      }
+    }
+    const curveBins = opt.curve ? new Float64Array(61) : null;
+    const pairsH1 = opt.pairs ? new Int16Array(sims) : null, pairsH2 = opt.pairs ? new Int16Array(sims) : null;
     const MAXP = 120;
     const total = new Float64Array(2 * MAXP), home = new Float64Array(MAXP), away = new Float64Array(MAXP);
     const h1 = st.half === 1 ? new Float64Array(2 * MAXP) : null;
@@ -211,6 +269,8 @@ export class DriveModel {
 
     for (let s = 0; s < sims; s++) {
       let half = st.half, t = st.hsr, h = st.homeScore, a = st.awayScore;
+      const g = env ? gamma(env.shape, rand) / env.rate : 1;
+      let h1Pts = st.half === 1 ? -1 : -2;   // first-half points for opt.pairs (-2 = unknown, state already in half 2)
       let possHome = opt.openingCoinFlip ? rand() < 0.5 : st.possHome;
       let y = st.y, down = st.down, togo = st.togo;
       const recv2 = st.recv2Home ?? (opt.openingCoinFlip ? !possHome : rand() < 0.5);
@@ -224,6 +284,7 @@ export class DriveModel {
         if (t <= 0) {
           if (half === 1) {
             if (h1 && !h1Done) { h1[Math.min(h + a, 2 * MAXP - 1)]++; h1Done = true; }
+            h1Pts = h + a;
             half = 2; t = this.halfSeconds; possHome = recv2; hTO = 3; aTO = 3;
             y = this.startFrom(this.kick, rand(), rand()); down = 1; togo = 10; first = false; continue;
           }
@@ -239,13 +300,14 @@ export class DriveModel {
         const base = this.probs.subarray(c * K, c * K + K);
         // Strength relative to the offenses this cell was fitted on: a 17-point leader's cell already reflects mostly strong teams,
         // so multiplying by the full lambda would count team strength twice (v1 over-predicted late NCAAF blowout scoring).
-        const l = (possHome ? lam[0] : lam[1]) / this.strength[c];
+        const l = g * (possHome ? lam[0] : lam[1]) / this.strength[c];
         const score = base[TD] + base[FG], scaledScore = Math.min(0.98, l * score);
         const rest = (1 - scaledScore) / Math.max(1e-9, 1 - score);
         for (let i = 0; i < K; i++) p[i] = base[i] * rest;
         p[TD] = score > 0 ? base[TD] * scaledScore / score : 0; p[FG] = score > 0 ? base[FG] * scaledScore / score : 0;
         const o = sampleDiscrete(p, rand()); nd++;
         t -= this.duration(o, t, y, !first || !!st.kickoff, rand());
+        const before = h + a;
         first = false;
         switch (o) {
           case TD: { const pts = this.tdPts.v[sampleDiscrete(this.tdPts.p, rand())]; if (possHome) h += pts; else a += pts; possHome = !possHome; y = this.startFrom(this.kick, rand(), rand()); break; }
@@ -256,7 +318,9 @@ export class DriveModel {
           default: { const ny = this.nextStart(o, y, rand(), rand()); possHome = !possHome; y = ny; }
         }
         down = 1; togo = Math.min(10, y);
+        if (curveBins && h + a > before) curveBins[clamp(Math.floor(((half - 1) * this.halfSeconds + this.halfSeconds - Math.max(t, 0)) / 60), 0, 60)] += h + a - before;
       }
+      if (pairsH1) { if (h1Pts === -1) h1Pts = h + a; pairsH1[s] = h1Pts; pairsH2![s] = h + a - h1Pts; }
       if (h1 && !h1Done) h1[Math.min(h + a, 2 * MAXP - 1)]++;
       dSum += nd; dSq += nd * nd;
       // Overtime (regular-season rules): some ties stand; otherwise the winner adds its OT points, the loser its own.
@@ -277,7 +341,9 @@ export class DriveModel {
     const norm = (x: Float64Array | null) => { if (x) for (let i = 0; i < x.length; i++) x[i] /= sims; return x; };
     for (const [k, v] of margin) margin.set(k, v / sims);
     return { n: sims, pHome: pH / sims, pAway: pA / sims, pTie: pT / sims, total: norm(total)!, home: norm(home)!, away: norm(away)!, h1Total: norm(h1), margin, lambda: lam,
-      drives: { mean: dSum / sims, sd: Math.sqrt(Math.max(0, dSq / sims - (dSum / sims) ** 2)) } };
+      drives: { mean: dSum / sims, sd: Math.sqrt(Math.max(0, dSq / sims - (dSum / sims) ** 2)) }, env,
+      ...(pairsH1 ? { pairs: { h1: pairsH1, h2: pairsH2! } } : {}),
+      ...(curveBins ? { curve: (() => { const c = new Float64Array(61); let acc = 0; for (let i = 0; i < 61; i++) { c[i] = acc; acc += curveBins[i] / sims; } return c; })() } : {}) };
   }
 }
 

@@ -37,7 +37,7 @@ const fakeSim = (): SimResult => {
   const total = new Float64Array(240); total[40] = 0.5; total[50] = 0.5;
   const home = new Float64Array(120); home[20] = 0.5; home[30] = 0.5;
   const away = new Float64Array(120); away[20] = 1;
-  return { n: 1, pHome: 0.5, pAway: 0.45, pTie: 0.05, total, home, away, h1Total: null, margin: new Map([[0, 0.5], [10, 0.5]]), lambda: [1, 1], drives: { mean: 0, sd: 0 } };
+  return { n: 1, pHome: 0.5, pAway: 0.45, pTie: 0.05, total, home, away, h1Total: null, margin: new Map([[0, 0.5], [10, 0.5]]), lambda: [1, 1], drives: { mean: 0, sd: 0 }, env: null };
 };
 
 test('fair prices per market type', () => {

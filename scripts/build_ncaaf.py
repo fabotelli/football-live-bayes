@@ -135,6 +135,7 @@ def main():
         'meanPointsPerGame': round(float((g.home_score + g.away_score).mean()), 3),
         'targets': B.dispersion_targets(dtr, dr),
         'durationShrink': 1.0,   # set by scripts/fit_dispersion.ts
+        'gameEnv': {'alpha': 0},  # set by scripts/fit_dispersion.ts (0 = no game-environment effect)
     }
     with open(os.path.join(ROOT, 'data', 'models', 'ncaaf_drive_v2.json'), 'w') as f: json.dump(model, f, separators=(',', ':'))
     n, ng = B.export_bt(d, dr_all, hold, os.path.join(CACHE, 'bt_states.csv.gz'))
