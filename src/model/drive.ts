@@ -19,12 +19,14 @@ export interface DriveModelJson {
   buckets: { tbEdges: number[]; gapEdges: number[]; togoEdges: number[]; zoneEdges: number[]; yBinWidth: number };
   outcome: number[][][][][][];                        // [tb][half x gap][yb][down-1][tg][outcome]
   strength: number[][][][][];                         // [tb][half x gap][yb][down-1][tg] mean pregame strength of the offenses in the cell
-  duration: Record<string, number[] | null>;          // `${outcome}|${tb}|${zone|*}` (drive in progress) and `S:...` (drive start) -> 21 quantiles of seconds
+  duration: Record<string, number[] | null>;          // `${outcome}|${tb}|${zone|*}` (drive in progress) and `S:...` (drive start) -> quantiles of seconds (evenly spaced)
   nextStart: Record<string, number[]>;                // `${outcome}|${yb}` -> P(next start yard bin)
   kickoffStart: Record<string, number[]>;             // season -> P(start yard bin) after a kickoff
   tdPoints: Record<string, number>;                   // "6"/"7"/"8" -> prob
   ot: { pTie: number; winnerAdd: Record<string, number>; loserAdd: Record<string, number> };
   halfSeconds?: number;                               // 1800 for NFL and NCAAF
+  durationShrink?: number;                            // drive-length dispersion factor, fitted by scripts/fit_dispersion.ts (1 = raw tables)
+  targets?: { h2DrivesSd: number; h2PointsSd: number; typicalPrior: Prior };  // real-data targets for the dispersion fit
 }
 
 export interface GameState {
@@ -48,6 +50,7 @@ export interface SimResult {
   home: Float64Array; away: Float64Array;   // P(team final points = k)
   h1Total: Float64Array | null; // P(first-half total = k) when the state is still in half 1, else null
   lambda: [number, number];
+  drives: { mean: number; sd: number };   // simulated drives from the state to the end of regulation (diagnostics)
 }
 
 const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
@@ -81,6 +84,9 @@ export class DriveModel {
   private strength: Float64Array;
   private nGap: number;
   private dur = new Map<string, Float64Array>();
+  private durMean = new Map<string, number>();
+  /** Drive lengths are drawn as mean + shrink * (draw - mean). Public so scripts/fit_dispersion.ts can search it. */
+  durShrink: number;
   private next = new Map<string, Float64Array>();
   private kick: Float64Array;
   private tdPts: { v: number[]; p: number[] };
@@ -97,7 +103,8 @@ export class DriveModel {
     this.probs = new Float64Array(j.outcome.flat(5) as number[]);
     this.strength = new Float64Array(j.strength.flat(4) as number[]);
     if (this.probs.length !== cells * K || this.strength.length !== cells) throw new Error('drive model tables have the wrong shape');
-    for (const [k, q] of Object.entries(j.duration)) if (q) this.dur.set(k, new Float64Array(q));
+    for (const [k, q] of Object.entries(j.duration)) if (q) { this.dur.set(k, new Float64Array(q)); this.durMean.set(k, q.reduce((s, x) => s + x, 0) / q.length); }
+    this.durShrink = j.durationShrink ?? 1;
     for (const [k, p] of Object.entries(j.nextStart)) this.next.set(k, new Float64Array(p));
     const seasons = Object.keys(j.kickoffStart).map(Number).sort((a, b) => a - b);
     // Kickoff rules changed in 2024 and 2025: use the requested season's start distribution, else the latest season on file.
@@ -129,11 +136,15 @@ export class DriveModel {
   /** Seconds the rest of the drive takes. `fresh` = the drive is just starting (simulated future drive), else in progress. */
   private duration(o: number, hsr: number, y: number, fresh: boolean, u: number): number {
     const b = this.j.buckets, tb = searchsortedLeft(b.tbEdges, hsr), zone = searchsortedLeft(b.zoneEdges, y), pre = fresh ? 'S:' : '';
-    const q = this.dur.get(`${pre}${OUTCOMES[o]}|${tb}|${zone}`) ?? this.dur.get(`${pre}${OUTCOMES[o]}|${tb}|*`)
-      ?? this.dur.get(`${OUTCOMES[o]}|${tb}|*`);
-    if (!q) return 150;
+    const key = [`${pre}${OUTCOMES[o]}|${tb}|${zone}`, `${pre}${OUTCOMES[o]}|${tb}|*`, `${OUTCOMES[o]}|${tb}|*`].find((k) => this.dur.has(k));
+    if (!key) return 150;
+    const q = this.dur.get(key)!;
     const x = u * (q.length - 1), i = Math.floor(x), f = x - i;
-    return i + 1 < q.length ? q[i] * (1 - f) + q[i + 1] * f : q[i];
+    const d = i + 1 < q.length ? q[i] * (1 - f) + q[i + 1] * f : q[i];
+    // Real drives in one game are more regular than independent draws from a table pooled over all teams and games, so the
+    // simulated drive COUNT came out too variable in college (2H sd 2.6 vs 2.35 real) and the totals distribution too wide.
+    // Shrinking each draw toward its table mean keeps the mean drive length and fixes the count dispersion.
+    return this.durShrink === 1 ? d : this.durMean.get(key)! + this.durShrink * (d - this.durMean.get(key)!);
   }
 
   private startFrom(dist: Float64Array, u1: number, u2: number): number {
@@ -194,7 +205,7 @@ export class DriveModel {
     const total = new Float64Array(2 * MAXP), home = new Float64Array(MAXP), away = new Float64Array(MAXP);
     const h1 = st.half === 1 ? new Float64Array(2 * MAXP) : null;
     const margin = new Map<number, number>();
-    let pH = 0, pA = 0, pT = 0;
+    let pH = 0, pA = 0, pT = 0, dSum = 0, dSq = 0;
     const p = new Float64Array(K);
     const pOTH = this.pHomeOT(prior);
 
@@ -208,7 +219,7 @@ export class DriveModel {
       // An upper bound on what the trailing defence has, which keeps the kneel-out rule from ending games that are still live.
       let hTO = st.half === 2 ? st.homeTO : 3, aTO = st.half === 2 ? st.awayTO : 3;
       if (st.kickoff) { y = this.startFrom(this.kick, rand(), rand()); down = 1; togo = 10; }
-      let h1Done = st.half === 2;
+      let h1Done = st.half === 2, nd = 0;
       for (let guard = 0; guard < 200; guard++) {
         if (t <= 0) {
           if (half === 1) {
@@ -233,7 +244,7 @@ export class DriveModel {
         const rest = (1 - scaledScore) / Math.max(1e-9, 1 - score);
         for (let i = 0; i < K; i++) p[i] = base[i] * rest;
         p[TD] = score > 0 ? base[TD] * scaledScore / score : 0; p[FG] = score > 0 ? base[FG] * scaledScore / score : 0;
-        const o = sampleDiscrete(p, rand());
+        const o = sampleDiscrete(p, rand()); nd++;
         t -= this.duration(o, t, y, !first || !!st.kickoff, rand());
         first = false;
         switch (o) {
@@ -247,6 +258,7 @@ export class DriveModel {
         down = 1; togo = Math.min(10, y);
       }
       if (h1 && !h1Done) h1[Math.min(h + a, 2 * MAXP - 1)]++;
+      dSum += nd; dSq += nd * nd;
       // Overtime (regular-season rules): some ties stand; otherwise the winner adds its OT points, the loser its own.
       if (h === a) {
         if (rand() < this.j.ot.pTie) { /* stays tied */ }
@@ -264,7 +276,8 @@ export class DriveModel {
     }
     const norm = (x: Float64Array | null) => { if (x) for (let i = 0; i < x.length; i++) x[i] /= sims; return x; };
     for (const [k, v] of margin) margin.set(k, v / sims);
-    return { n: sims, pHome: pH / sims, pAway: pA / sims, pTie: pT / sims, total: norm(total)!, home: norm(home)!, away: norm(away)!, h1Total: norm(h1), margin, lambda: lam };
+    return { n: sims, pHome: pH / sims, pAway: pA / sims, pTie: pT / sims, total: norm(total)!, home: norm(home)!, away: norm(away)!, h1Total: norm(h1), margin, lambda: lam,
+      drives: { mean: dSum / sims, sd: Math.sqrt(Math.max(0, dSq / sims - (dSum / sims) ** 2)) } };
   }
 }
 

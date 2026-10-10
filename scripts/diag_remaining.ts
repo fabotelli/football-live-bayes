@@ -1,5 +1,8 @@
 // Diagnostic: predicted vs actual REMAINING points from holdout states, split by game phase x current score gap x pregame spread.
-// Finds where the total is mis-sized (e.g. NCAAF blowouts). Reads the same files as scripts/backtest.ts; no network.
+// Finds where the total is mis-sized (e.g. NCAAF blowouts) and whether its spread is right: `sd` is the model's predicted SD of the
+// remaining total, `rmse` the actual error of its mean (sd > rmse = distribution too wide), and the PIT row is the share of real
+// outcomes in each decile of the predicted distribution (flat = calibrated; humped in the middle = too wide).
+// Reads the same files as scripts/backtest.ts; no network.
 //   node scripts/diag_remaining.ts [--league ncaaf] [--frac 0.15] [--sims 600]
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
@@ -12,9 +15,10 @@ const model = new DriveModel(JSON.parse(readFileSync(root + `data/models/${LEAGU
 const csv = gunzipSync(readFileSync(root + `data/cache/${LEAGUE}/bt_states.csv.gz`)).toString('utf8').trim().split('\n');
 const hdr = csv[0].split(','); const ix = (k: string) => hdr.indexOf(k);
 
-type Acc = { n: number; pred: number; act: number };
+type Acc = { n: number; pred: number; act: number; v: number; se: number };
 const acc = new Map<string, Acc>();
-const add = (k: string, p: number, a: number) => { const x = acc.get(k) ?? acc.set(k, { n: 0, pred: 0, act: 0 }).get(k)!; x.n++; x.pred += p; x.act += a; };
+const add = (k: string, p: number, a: number, v: number) => { const x = acc.get(k) ?? acc.set(k, { n: 0, pred: 0, act: 0, v: 0, se: 0 }).get(k)!; x.n++; x.pred += p; x.act += a; x.v += v; x.se += (p - a) ** 2; };
+const pit = new Map<string, number[]>();
 let i = 0;
 for (const line of csv.slice(1)) {
   if (((i++ * 2654435761) >>> 0) / 4294967296 > FRAC) continue;    // deterministic subsample
@@ -26,10 +30,18 @@ for (const line of csv.slice(1)) {
   const res = model.simulate({ half: g('half') as 1 | 2, hsr: g('hsr'), homeScore: g('hs'), awayScore: g('as'), possHome: g('pos_home') === 1, y: g('y'),
     down: g('down') as 1 | 2 | 3 | 4, togo: g('togo'), homeTO: g('hto'), awayTO: g('ato'), recv2Home: g('recv2_home') === 1 },
     { spread: g('spread'), total: g('total') }, { sims: SIMS });
-  const pred = mean(res.total) - g('hs') - g('as'), act = g('final_h') + g('final_a') - g('hs') - g('as');
-  add(`${phase} | all`, pred, act); add(`${phase} | ${gapB}`, pred, act); add(`${phase} | ${spB}`, pred, act);
+  const now = g('hs') + g('as'), m = mean(res.total);
+  let v = 0; for (let k = 0; k < res.total.length; k++) v += res.total[k] * (k - m) ** 2;
+  const pred = m - now, act = g('final_h') + g('final_a') - now;
+  add(`${phase} | all`, pred, act, v); add(`${phase} | ${gapB}`, pred, act, v); add(`${phase} | ${spB}`, pred, act, v);
+  // PIT with ties split evenly: P(total < actual) + 0.5 P(total = actual)
+  const fin = g('final_h') + g('final_a'); let below = 0; for (let k = 0; k < Math.min(fin, res.total.length); k++) below += res.total[k];
+  const u = below + 0.5 * (res.total[fin] ?? 0);
+  for (const key of [phase, 'ALL']) { const h = pit.get(key) ?? pit.set(key, new Array(10).fill(0)).get(key)!; h[Math.min(9, Math.floor(u * 10))]++; }
 }
 console.log(`${LEAGUE}: predicted vs actual remaining points (holdout, frac ${FRAC})`);
-console.log('phase | group          n     pred    actual   pred-act');
+console.log('phase | group          n     pred    actual   pred-act     sd    rmse');
 for (const [k, a] of [...acc].sort()) if (a.n >= 30)
-  console.log(`${k.padEnd(20)} ${String(a.n).padStart(5)}  ${(a.pred / a.n).toFixed(2).padStart(6)}  ${(a.act / a.n).toFixed(2).padStart(7)}  ${((a.pred - a.act) / a.n).toFixed(2).padStart(7)}`);
+  console.log(`${k.padEnd(20)} ${String(a.n).padStart(5)}  ${(a.pred / a.n).toFixed(2).padStart(6)}  ${(a.act / a.n).toFixed(2).padStart(7)}  ${((a.pred - a.act) / a.n).toFixed(2).padStart(7)}  ${Math.sqrt(a.v / a.n).toFixed(2).padStart(6)}  ${Math.sqrt(a.se / a.n).toFixed(2).padStart(6)}`);
+console.log('\nPIT deciles (% of outcomes; 10 each = calibrated)');
+for (const [k, h] of [...pit].sort()) { const n = h.reduce((s, x) => s + x, 0); console.log(`${k.padEnd(6)} ${h.map((x) => (100 * x / n).toFixed(1).padStart(5)).join(' ')}`); }

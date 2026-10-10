@@ -55,3 +55,15 @@ test('NCAAF tables load and calibrate a big college spread without hitting the l
   assert.ok(r.lambda[0] < 4 && r.lambda[1] > 0.2);
   assert.equal(r.pTie, 0);
 });
+
+test('fitted drive-length dispersion: simulated 2H drive count and points spread match real-game targets', () => {
+  for (const lg of ['nfl', 'ncaaf']) {
+    const j = JSON.parse(readFileSync(new URL(`../data/models/${lg}_drive_v2.json`, import.meta.url), 'utf8'));
+    assert.ok(j.durationShrink > 0 && j.durationShrink <= 1, `${lg} durationShrink ${j.durationShrink}`);
+    const r = new DriveModel(j).simulate({ half: 2, hsr: 1800, homeScore: 0, awayScore: 0, possHome: true, kickoff: true, y: 75, down: 1, togo: 10, homeTO: 3, awayTO: 3, recv2Home: true },
+      j.targets.typicalPrior, { sims: 20000, seed: 99 });
+    const mu = mean(r.total); let v = 0; for (let k = 0; k < r.total.length; k++) v += r.total[k] * (k - mu) ** 2;
+    assert.ok(r.drives.sd <= j.targets.h2DrivesSd * 1.06, `${lg} drives sd ${r.drives.sd} vs ${j.targets.h2DrivesSd}`);
+    assert.ok(Math.abs(Math.sqrt(v) / j.targets.h2PointsSd - 1) < 0.08, `${lg} 2H pts sd ${Math.sqrt(v)} vs ${j.targets.h2PointsSd}`);
+  }
+});

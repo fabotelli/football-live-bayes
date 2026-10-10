@@ -12,7 +12,8 @@ which is per-season because the kickoff rules changed in 2024 and 2025):
            conditioned on the score gap are dominated by strong teams when leading big and weak ones when trailing big; the engine
            divides each team's strength by the cell's r so team strength is not counted twice (the cause of the NCAAF late-game
            over-prediction in drive model v1)
-  duration quantiles of the seconds the rest of the drive takes, by (result, time bucket, field zone)
+  duration quantiles (2.5% steps, capped at p99, feed gaps > 10 min dropped) of the seconds the rest of the drive takes, by
+           (result, time bucket, field zone)
   nextStart where the other team starts after a non-scoring drive end, by (result, yards-to-goal bin of the state)
   kickoff  start-position distribution after a score, per season
   tdPoints distribution of points on a touchdown drive (6/7/8)
@@ -151,15 +152,27 @@ def smoothed_table(s):
     return np.round(p3, 5), int(len(s))
 
 
-def quantiles(x, q=21):
+MAX_DRIVE_SECONDS = 600   # no real drive lasts 10 minutes; longer "drives" are feed gaps (skipped drives), mostly in college data
+
+
+def quantiles(x, q=41):
+    """q evenly spaced quantiles (2.5% steps), the top one capped at the 99th percentile. The engine interpolates linearly between
+    neighbouring quantiles, so an outlier at q100 would be drawn from uniformly across the whole top step; drive model v2 used 5%
+    steps up to the raw max (college maxima of 1100-1800s), which made simulated drives too long and their count too variable,
+    and the NCAAF totals distribution too wide."""
     x = np.asarray(x, dtype=float)
-    return [round(float(v), 1) for v in np.quantile(x, np.linspace(0, 1, q))] if len(x) else None
+    if not len(x): return None
+    qs = np.quantile(x, np.linspace(0, 1, q))
+    qs[-1] = min(qs[-1], np.quantile(x, 0.99))
+    return [round(float(v), 1) for v in qs]
 
 
 def duration_table(s, prefix=''):
     """Quantiles of the seconds left in the drive. Called twice: on every state (for the drive in progress, `prefix=''`) and on
     drive-start states only (`prefix='S:'`, for simulated future drives). Pooling mid-drive states into future drives would make
-    them too short and fit too many drives into the game."""
+    them too short and fit too many drives into the game. States whose drive "lasts" over MAX_DRIVE_SECONDS are feed gaps and
+    are left out."""
+    s = s[s.rem <= MAX_DRIVE_SECONDS]
     out = {}
     for (o, tb, z), g in s.groupby(['result', 'tb', 'zone']):
         if len(g) >= 30: out[f'{prefix}{o}|{tb}|{z}'] = quantiles(g.rem)
@@ -208,6 +221,20 @@ def ot_table(d, games):
     return {'n': int(len(x)), 'pTie': round(float(tie.mean()), 4),
             'winnerAdd': {str(k): round(float(v), 4) for k, v in win_add.value_counts(normalize=True).sort_index().items()},
             'loserAdd': {str(k): round(float(v), 4) for k, v in lose_add.value_counts(normalize=True).sort_index().items()}}
+
+
+def dispersion_targets(d, dr):
+    """Real-data targets for scripts/fit_dispersion.ts: SD of second-half drive counts per game and of second-half points
+    after regressing on the closing total and |spread|, plus a typical prior (median lines) to simulate at."""
+    c2 = dr[dr.half == 'Half2'].groupby('game_id').size()
+    g = d.groupby('game_id').first()
+    h1 = d[d.game_half == 'Half1'].groupby('game_id')[['total_home_score', 'total_away_score']].max().sum(axis=1)
+    reg = d[d.game_half != 'Overtime'].groupby('game_id')[['total_home_score', 'total_away_score']].max().sum(axis=1)
+    x = pd.DataFrame({'c2': c2, 'h2': reg - h1, 'tl': g.total_line, 'sp': g.spread_line.abs()}).dropna()
+    X = np.column_stack([np.ones(len(x)), x.tl, x.sp])
+    res = x.h2 - X @ np.linalg.lstsq(X, x.h2, rcond=None)[0]
+    return {'h2DrivesSd': round(float(x.c2.std()), 3), 'h2PointsSd': round(float(res.std()), 3),
+            'typicalPrior': {'spread': round(float(x.sp.median()) * 2) / 2, 'total': round(float(x.tl.median()) * 2) / 2}}
 
 
 def export_bt(d, dr, seasons, path, every=3):
@@ -259,6 +286,8 @@ def main():
         'tdPoints': td_points(dr),
         'ot': ot_table(d[d.season.isin(train)], games),
         'meanPointsPerGame': round(float(games[(games.game_type == 'REG') & games.season.isin(train)].total.mean()), 3),
+        'targets': dispersion_targets(dtr, dr),
+        'durationShrink': 1.0,   # set by scripts/fit_dispersion.ts
     }
     os.makedirs(os.path.join(ROOT, 'data', 'models'), exist_ok=True)
     with open(os.path.join(ROOT, 'data', 'models', 'nfl_drive_v2.json'), 'w') as f: json.dump(model, f, separators=(',', ':'))
