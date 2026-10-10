@@ -59,6 +59,8 @@ See `BACKTEST.md` for the latest numbers and how to read them.
   quotes. The real question (does Kalshi's live book lag the state?) needs Kalshi trades/candlesticks for past games, or the
   shadow log.
 - **Late game.** The model trails the benchmark in the last 5 minutes (clock strategy); the shadow loop blocks there by policy.
+- **NCAAF totals tails.** The v1 over-prediction is fixed (it was a play-ordering data bug, see BACKTEST.md); the remaining-total
+  distribution is still a little too wide in college (underconfident at the extremes).
 - **NCAAF team codes.** ESPN → Kalshi college codes differ a lot; unmatched games log `NO_MARKET_MATCH` (never mis-priced).
   Needs a mapping table built from `KXNCAAFGAME` tickers (the old `ht_bot.NCAAFTickers` name-normalised fallback is a good model).
 - 1H team totals need per-team first-half distributions (not simulated yet); no live Bayesian update of λ from in-game
