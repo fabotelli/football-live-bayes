@@ -1,11 +1,12 @@
 // Holdout backtest of the drive model against real NFL outcomes and against nflverse's own market-anchored WP (vegas_home_wp).
 // Inputs: data/cache/nfl/bt_states.csv.gz (scripts/build_nfl.py), data/models/nfl_drive_v2.json. Never touches the network.
 // Prints log loss / Brier for home-win by game phase, and calibration of P(final total > closing total) from in-game states.
-//   node scripts/backtest.ts [--league nfl|ncaaf] [--sims 1000] [--seasons 2024,2025,2026] [--max 0]
+//   node scripts/backtest.ts [--plays] [--league nfl|ncaaf] [--sims 1000] [--seasons 2024,2025,2026] [--max 0]
 // The NCAAF benchmark column is cfbfastR's spread-adjusted home_wp_before (stored in the same vegas_home_wp field).
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { DriveModel, pOver, type GameState } from '../src/model/drive.ts';
+import { loadModel } from '../src/model/load.ts';
 
 const arg = (k: string, d: string) => { const i = process.argv.indexOf('--' + k); return i > 0 ? process.argv[i + 1] : d; };
 const SIMS = Number(arg('sims', '1000')), MAX = Number(arg('max', '0'));
@@ -19,7 +20,9 @@ let rows = csv.slice(1).map((l) => l.split(',')).filter((r) => SEASONS.has(Numbe
 if (MAX > 0) rows = rows.filter((_, i) => i % Math.ceil(rows.length / MAX) === 0);
 
 const models = new Map<number, DriveModel>();
-const modelFor = (season: number) => models.get(season) ?? models.set(season, new DriveModel(json, season)).get(season)!;
+// --plays: simulate the end of each half with the play sampler (src/model/plays.ts), as loadModel attaches it.
+const PLAYS = process.argv.includes('--plays');
+const modelFor = (season: number) => models.get(season) ?? models.set(season, PLAYS ? loadModel(LEAGUE, season) : new DriveModel(json, season)).get(season)!;
 const ll = (p: number, y: number) => -(y * Math.log(Math.max(p, 1e-6)) + (1 - y) * Math.log(Math.max(1 - p, 1e-6)));
 type Acc = { n: number; llM: number; llV: number; brM: number; brV: number };
 const phases = new Map<string, Acc>();
