@@ -7,7 +7,26 @@ P(home wins) with the real result and with a benchmark WP, and check P(final tot
 **How to read it.** Matching or beating the benchmark says the state model is sound. It does **not** show a trading edge:
 Kalshi's live book is the real opponent, and no historical Kalshi prices were available here.
 
-## Open: NCAAF in-game under-lean (investigated 2026-10-11, NOT fixed)
+## Open: NCAAF in-game under-lean, end-of-half work (2026-10-11/12, NOT fixed; NCAAF totals blocked in Q2-Q3)
+Current numbers (scripts/lean_test.ts, all 1,031 holdout games, one random state per game per phase, model minus actual
+remaining points): pregame -0.19 +/- 0.48 | Q1 -0.58 +/- 0.46 | Q2 -0.69 +/- 0.37 | Q3 -0.45 +/- 0.29 | Q4 -0.17 +/- 0.20
+(drive model; with the play sampler: -0.64 / -0.62 / -0.41 / -0.04). Pregame is right; the gap opens once the game is
+under way because the model's scoring is mis-timed. Like-for-like (300 training games at their own lines), share of points by
+window (>5:00, 5:00-2:00, last 2:00 per half): real 38.1 5.0 8.8 | 38.1 4.9 5.2, drive model 39.4 5.5 7.9 | 38.0 4.7 4.5,
+with the play sampler 40.1 5.0 7.4 | 38.8 4.8 3.8. (Earlier single-line comparisons exaggerated this; use same-games tests.)
+
+Fixed along the way (all in the committed tables): college kickoff rows taken as drive starts (drives started 10 yards too far
+forward); next-drive start looked up from pooled states (opponent got ~2-4 yards too good a start); buzzer-score binning; kickoff
+returns lost between drives. Each was real; none closed the lean on its own.
+
+End-of-half play sampler (src/model/plays.ts): real snaps from the last 10:00 of each half, with series outcomes, timeouts and
+buzzer snaps. Per-snap outcomes from real states now match (TD/FG/punt rates, down mix), but from real 2:00 states it runs ~5%
+fewer snaps and ~10-18% fewer scores than real games, and over whole games it does worse than the drive tables at the end of
+halves. It is NOT used by the shadow loop or the backtests (loadModel attaches it; shadow/backtest construct DriveModel without
+it). Next steps if resumed: find why snaps run short in the last 2:00 (clock of half-ending samples, defensive timeouts not in
+the group key), then re-run the same-games share test and lean_test.ts with plays on.
+
+## Superseded: first investigation (2026-10-11)
 Game-weighted holdout test (one random state per game per phase, 1,031 games; per-game standard errors, because states within
 a game share one outcome and the play-weighted diagnostic overstates precision): model minus actual remaining points
 Q1 −0.44 ± 0.46, **Q2 −0.81 ± 0.37**, Q3 −0.47 ± 0.30, Q4 +0.02 ± 0.20. Pregame there is no lean (207 holdout games:
