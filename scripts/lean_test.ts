@@ -2,7 +2,7 @@
 // actual remaining points, with per-game standard errors. (States within a game share one outcome, so a play-weighted average
 // overstates precision; this is the test that showed the NCAAF Q2-Q3 under-lean, BACKTEST.md.)
 // Lines are rounded (spread to 1, total to 2) so games share the line calibration; this is a test of the in-game dynamics.
-//   node scripts/lean_test.ts [--league ncaaf] [--max 400] [--sims 1500] [--no-plays]
+//   node scripts/lean_test.ts [--league ncaaf] [--max 400] [--sims 1500] [--no-plays] [--pregame-only]
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { loadModel } from '../src/model/load.ts';
@@ -22,6 +22,17 @@ const rand = rng(7);
 const acc: Record<string, { n: number; b: number; ss: number }> = {};
 for (const id of games) {
   const rs = byGame.get(id)!;
+  {   // pregame: the same game from kickoff, same rounded line (checks the anchor itself)
+    const r0 = rs[0], g0 = (k: string) => Number(r0[ix(k)]);
+    const pr = { spread: Math.round(g0('spread')), total: 2 * Math.round(g0('total') / 2) };
+    const res = m.simulate({ half: 1, hsr: 1800, homeScore: 0, awayScore: 0, possHome: true, kickoff: true, y: 75, down: 1, togo: 10, homeTO: 3, awayTO: 3, recv2Home: null },
+      pr, { sims: SIMS, openingCoinFlip: true });
+    const d = mean(res.total) - (g0('final_h') + g0('final_a'));
+    const a = acc['Q0 pregame'] ??= { n: 0, b: 0, ss: 0 }; a.n++; a.b += d; a.ss += d * d;
+    const dl = (g0('final_h') + g0('final_a')) - pr.total; const al = acc['Q0 actual - rounded line'] ??= { n: 0, b: 0, ss: 0 }; al.n++; al.b += dl; al.ss += dl * dl;
+    const ml = mean(res.total) - pr.total; const am = acc['Q0 model - rounded line'] ??= { n: 0, b: 0, ss: 0 }; am.n++; am.b += ml; am.ss += ml * ml;
+  }
+  if (process.argv.includes('--pregame-only')) continue;
   for (const ph of ['Q1', 'Q2', 'Q3', 'Q4']) {
     const g = (r: string[], k: string) => Number(r[ix(k)]);
     const inPh = rs.filter((r) => { const gsr = (g(r, 'half') === 1 ? 1800 : 0) + g(r, 'hsr'); return ph === (gsr > 2700 ? 'Q1' : gsr > 1800 ? 'Q2' : gsr > 900 ? 'Q3' : 'Q4'); });
