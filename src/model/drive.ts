@@ -16,6 +16,8 @@
 // with c = E[x^2]/E[x] of points per drive turning points into effective event counts. alpha is fitted per league
 // (scripts/fit_dispersion.ts); alpha = 0 switches the effect off.
 
+import { PlayModel, EV } from './plays.ts';
+
 export const OUTCOMES = ['TD', 'FG', 'PUNT', 'TO', 'DOWNS', 'MISSFG', 'END', 'OPPTD', 'SAFETY'] as const;
 export type Outcome = typeof OUTCOMES[number];
 const [TD, FG, PUNT, TO, DOWNS, MISSFG, END, OPPTD, SAFETY] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -70,6 +72,7 @@ export interface SimOptions {
   env?: EnvMode;       // posterior (default): update g from the score so far; prior: ignore the score (used for fitting); off: g = 1
   pairs?: boolean;     // collect per-path 1H/2H points
   curve?: boolean;     // collect the expected cumulative points by elapsed minute (internal, used by lambdas)
+  stats?: boolean;     // collect drive-level diagnostics (outcome counts and mean start yards-to-goal, by half)
 }
 
 /** Standard normal (Box-Muller) and Gamma(shape >= 1, rate 1) via Marsaglia-Tsang, both from the seeded uniform source. */
@@ -132,7 +135,11 @@ export class DriveModel {
   timeFactor: number[][];
   readonly halfSeconds: number;
 
-  constructor(j: DriveModelJson, season?: number) {
+  /** End-of-half play sampler; when set, the last `plays.start` seconds of each half are simulated play by play. */
+  plays: PlayModel | null;
+
+  constructor(j: DriveModelJson, season?: number, plays?: PlayModel | null) {
+    this.plays = plays ?? null;
     this.j = j;
     if (j.outcomes.join() !== OUTCOMES.join()) throw new Error('drive model outcome order mismatch');
     this.nGap = j.buckets.gapEdges.length + 1;
@@ -191,10 +198,13 @@ export class DriveModel {
     const bin = sampleDiscrete(dist, u1);
     return clamp(bin * 10 + 1 + Math.floor(u2 * 10), 1, 99);
   }
-  private nextStart(o: number, y: number, u1: number, u2: number): number {
-    const yb = clamp(Math.floor((y - 1) / 10), 0, 9);
-    let d = this.next.get(`${OUTCOMES[o]}|${yb}`);
-    for (let k = 1; !d && k < 10; k++) d = this.next.get(`${OUTCOMES[o]}|${clamp(yb - k, 0, 9)}`) ?? this.next.get(`${OUTCOMES[o]}|${clamp(yb + k, 0, 9)}`);
+  /** Where the other team starts after a non-scoring end. `from`: '' = drive in progress (keyed by its current spot),
+   *  'S:' = simulated drive drawn at its start, 'E:' = the ball's spot when possession changes (play sampler). */
+  private nextStart(o: number, y: number, u1: number, u2: number, from: '' | 'S:' | 'E:' = ''): number {
+    const yb = clamp(Math.floor((y - 1) / 10), 0, 9), O = OUTCOMES[o];
+    const get = (b: number) => this.next.get(`${from}${O}|${b}`) ?? this.next.get(`${O}|${b}`);
+    let d = get(yb);
+    for (let k = 1; !d && k < 10; k++) d = get(clamp(yb - k, 0, 9)) ?? get(clamp(yb + k, 0, 9));
     // Fallback (should not happen with the shipped tables): the receiving team starts at the spot of the change of possession.
     return d ? this.startFrom(d, u1, u2) : clamp(100 - y, 1, 99);
   }
@@ -264,6 +274,7 @@ export class DriveModel {
       }
     }
     const curveBins = opt.curve ? new Float64Array(61) : null;
+    const dstats = opt.stats ? { n: [0, 0], y: [0, 0], o: [new Float64Array(K), new Float64Array(K)], nextY: new Float64Array(K), nextN: new Float64Array(K), win: Array.from({ length: 6 }, () => ({ n: 0, td: 0, fg: 0, y: 0, gap: 0 })) } : null;
     const pairsH1 = opt.pairs ? new Int16Array(sims) : null, pairsH2 = opt.pairs ? new Int16Array(sims) : null;
     const MAXP = 120;
     const total = new Float64Array(2 * MAXP), home = new Float64Array(MAXP), away = new Float64Array(MAXP);
@@ -281,9 +292,9 @@ export class DriveModel {
       let y = st.y, down = st.down, togo = st.togo;
       const recv2 = st.recv2Home ?? (opt.openingCoinFlip ? !possHome : rand() < 0.5);
       let first = true;
-      // Timeouts are not simulated play by play: each team keeps what it has now for the rest of this half (3 each after halftime).
-      // An upper bound on what the trailing defence has, which keeps the kneel-out rule from ending games that are still live.
-      let hTO = st.half === 2 ? st.homeTO : 3, aTO = st.half === 2 ? st.awayTO : 3;
+      // Timeouts: the state's for the current half, 3 each after halftime. The drive-level part only uses them for the kneel-out
+      // rule; the end-of-half play sampler spends them.
+      let hTO = st.homeTO, aTO = st.awayTO;
       if (st.kickoff) { y = this.startFrom(this.kick, rand(), rand()); down = 1; togo = 10; }
       let h1Done = st.half === 2, nd = 0;
       for (let guard = 0; guard < 200; guard++) {
@@ -297,6 +308,40 @@ export class DriveModel {
           break;
         }
         const diff = possHome ? h - a : a - h;
+        // End of half: hand off to the play sampler (real end-of-half snaps carry the clock rules, timeouts, hurry-up and kneels).
+        if (this.plays && t <= this.plays.start) {
+          for (let snaps = 0; t > 0 && snaps < 400; snaps++) {
+            const df = possHome ? h - a : a - h;
+            const tilt = g * this.timeFactor[half - 1][t > 300 ? 0 : t > 120 ? 1 : 2] * (possHome ? lam[0] : lam[1]) / this.strength[this.cell(half, t, df, y, down, togo)];
+            const pl = this.plays.sample(half, t, y, down, togo, df, possHome ? hTO : aTO, tilt, rand);
+            if (possHome) { hTO = Math.max(0, hTO - pl.offTO); aTO = Math.max(0, aTO - pl.defTO); } else { aTO = Math.max(0, aTO - pl.offTO); hTO = Math.max(0, hTO - pl.defTO); }
+            t -= pl.clock;
+            const before = h + a;
+            let ev: number = pl.ev, flip = false;
+            if (ev === EV.PLAY) {
+              y -= pl.gain;
+              if (y <= 0) ev = EV.TD;
+              else if (y >= 100) ev = EV.SAFETY;
+              else if (pl.gain >= togo) { down = 1; togo = Math.min(10, y); }
+              else if (down >= 4) { flip = true; y = clamp(100 - y, 1, 99); nd++; }          // turnover on downs at the spot
+              else { down++; togo -= pl.gain; }
+            }
+            switch (ev) {
+              case EV.TD: { const pts = this.tdPts.v[sampleDiscrete(this.tdPts.p, rand())]; if (possHome) h += pts; else a += pts; flip = true; y = this.startFrom(this.kick, rand(), rand()); nd++; break; }
+              case EV.FG_GOOD: { if (possHome) h += 3; else a += 3; flip = true; y = this.startFrom(this.kick, rand(), rand()); nd++; break; }
+              case EV.FG_MISS: { flip = true; y = this.nextStart(MISSFG, y, rand(), rand(), 'E:'); nd++; break; }
+              case EV.PUNT: { flip = true; y = this.nextStart(PUNT, y, rand(), rand(), 'E:'); nd++; break; }
+              case EV.TO: { flip = true; y = this.nextStart(TO, y, rand(), rand(), 'E:'); nd++; break; }
+              case EV.DEF_TD: { const pts = this.tdPts.v[sampleDiscrete(this.tdPts.p, rand())]; if (possHome) a += pts; else h += pts; y = this.startFrom(this.kick, rand(), rand()); nd++; break; }
+              case EV.SAFETY: { if (possHome) a += 2; else h += 2; flip = true; y = clamp(Math.round(55 + rand() * 15), 1, 99); nd++; break; }
+            }
+            if (flip) possHome = !possHome;
+            if (ev !== EV.PLAY || flip) { down = 1; togo = Math.min(10, y); }
+            if (curveBins && h + a > before) curveBins[clamp(Math.floor(((half - 1) * this.halfSeconds + this.halfSeconds - Math.max(t, 1)) / 60), 0, 59)] += h + a - before;
+          }
+          t = 0; first = false;
+          continue;
+        }
         // Victory formation: the leader has the ball late and can kneel the clock out (timeouts only known for the current drive).
         if (half === 2 && diff > 0) {
           const snaps = 5 - down, defTO = possHome ? aTO : hTO;
@@ -312,7 +357,10 @@ export class DriveModel {
         for (let i = 0; i < K; i++) p[i] = base[i] * rest;
         p[TD] = score > 0 ? base[TD] * scaledScore / score : 0; p[FG] = score > 0 ? base[FG] * scaledScore / score : 0;
         const o = sampleDiscrete(p, rand()); nd++;
-        t -= this.duration(o, half, t, y, !first || !!st.kickoff, rand());
+        if (dstats && down === 1) { dstats.n[half - 1]++; dstats.y[half - 1] += y; dstats.o[half - 1][o]++; }
+        if (dstats && down === 1) { const w = dstats.win[(half - 1) * 3 + (t > 300 ? 0 : t > 120 ? 1 : 2)]; w.n++; w.y += y; w.gap += Math.abs(diff); if (o === TD) w.td++; if (o === FG) w.fg++; }
+        const fresh = !first || !!st.kickoff;   // a drive starting now (vs the live state's drive in progress)
+        t -= this.duration(o, half, t, y, fresh, rand());
         const before = h + a;
         first = false;
         switch (o) {
@@ -321,8 +369,9 @@ export class DriveModel {
           case OPPTD: { const pts = this.tdPts.v[sampleDiscrete(this.tdPts.p, rand())]; if (possHome) a += pts; else h += pts; y = this.startFrom(this.kick, rand(), rand()); break; } // scorer kicks off back to the same offense
           case SAFETY: { if (possHome) a += 2; else h += 2; possHome = !possHome; y = clamp(Math.round(55 + rand() * 15), 1, 99); break; } // free kick to the team that scored
           case END: { t = 0; break; }
-          default: { const ny = this.nextStart(o, y, rand(), rand()); possHome = !possHome; y = ny; }
+          default: { const ny = this.nextStart(o, y, rand(), rand(), fresh ? 'S:' : ''); possHome = !possHome; y = ny; }
         }
+        if (dstats && t > 0 && o !== END) { dstats.nextY[o] += y; dstats.nextN[o]++; }   // where the next drive starts (diagnostics)
         down = 1; togo = Math.min(10, y);
         // Bin the points at the drive's end time; a drive whose clock ran past 0:00 scored at the end of ITS half (t >= 1 keeps it
         // in that half's last minute; clamping at 0 filed buzzer scores into the next half's first minute).
@@ -351,6 +400,7 @@ export class DriveModel {
     return { n: sims, pHome: pH / sims, pAway: pA / sims, pTie: pT / sims, total: norm(total)!, home: norm(home)!, away: norm(away)!, h1Total: norm(h1), margin, lambda: lam,
       drives: { mean: dSum / sims, sd: Math.sqrt(Math.max(0, dSq / sims - (dSum / sims) ** 2)) }, env,
       ...(pairsH1 ? { pairs: { h1: pairsH1, h2: pairsH2! } } : {}),
+      ...(dstats ? { stats: dstats } : {}),
       ...(curveBins ? { curve: (() => { const c = new Float64Array(61); let acc = 0; for (let i = 0; i < 61; i++) { c[i] = acc; acc += curveBins[i] / sims; } return c; })() } : {}) };
   }
 }

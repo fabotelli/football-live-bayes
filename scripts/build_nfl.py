@@ -56,7 +56,9 @@ def load(seasons):
     cols = ['game_id', 'season', 'season_type', 'week', 'home_team', 'away_team', 'posteam', 'defteam', 'play_type', 'down', 'ydstogo',
             'yardline_100', 'half_seconds_remaining', 'game_seconds_remaining', 'game_half', 'qtr', 'fixed_drive', 'fixed_drive_result',
             'total_home_score', 'total_away_score', 'posteam_score', 'defteam_score', 'posteam_timeouts_remaining',
-            'defteam_timeouts_remaining', 'spread_line', 'total_line', 'vegas_home_wp', 'home_score', 'away_score', 'play_id']
+            'defteam_timeouts_remaining', 'spread_line', 'total_line', 'vegas_home_wp', 'home_score', 'away_score', 'play_id',
+            # play-level fields for scripts/build_plays.py
+            'yards_gained', 'touchdown', 'td_team', 'field_goal_result', 'punt_attempt', 'interception', 'fumble_lost', 'safety']
     out = []
     for s in seasons:
         p = os.path.join(CACHE, f'pbp_{s}.csv.gz')
@@ -86,7 +88,11 @@ def drive_frame(d):
     dr['pts_for'] = np.where(is_home, dh, da)
     dr['pts_against'] = np.where(is_home, da, dh)
     # The next drive's starting state (for nextStart): first scrimmage yardline of the following drive.
-    scr = d[d.down.notna() & d.yardline_100.notna()]
+    # Kickoff / PAT rows are not snaps: college (CFBD) kickoff rows carry down 1 and the kickoff spot (65 yards to go), so letting
+    # them count gave every post-kickoff drive a start ~10 yards too far forward (drive model v2 college bug: simulated drives
+    # started at 66.7 yards to goal on average vs 71.3 real, over-producing points that the line calibration then took back from
+    # every team, starving end-of-half scoring).
+    scr = d[d.down.notna() & d.yardline_100.notna() & ~d.play_type.isin(['kickoff', 'extra_point'])]
     st = scr.groupby(['game_id', 'fixed_drive']).yardline_100.first().reset_index(name='start_y')
     dr = dr.merge(st, on=['game_id', 'fixed_drive'], how='left')
     dr['next_start_y'] = np.where(dr.groupby('game_id').half.shift(-1) == dr.half, dr.groupby('game_id').start_y.shift(-1), np.nan)
@@ -187,13 +193,21 @@ def duration_table(s, prefix=''):
 
 
 def next_start_table(s, dr):
-    """Where the OTHER team starts after a non-scoring end, keyed by (result, yards-to-goal bin of the state)."""
+    """Where the OTHER team starts after a non-scoring end, keyed by (result, yards-to-goal bin). Three variants by which state the
+    key's yards-to-goal comes from, matching how the engine asks:
+      ''   any state of the drive          (the drive in progress, drawn from its current state)
+      'S:' the drive's first snap          (a simulated future drive, drawn at its start)
+      'E:' the drive's last snap           (the end-of-half play sampler: the ball is where possession changes)
+    Pooling every state for fresh drives handed the opponent ~2 yards too good a start after punts (~4 after turnovers on downs),
+    because later states of a drive sit further downfield than its start."""
     x = s.merge(dr[['game_id', 'fixed_drive', 'next_start_y', 'next_posteam']], on=['game_id', 'fixed_drive'])
     x = x[x.result.isin(['PUNT', 'TO', 'DOWNS', 'MISSFG']) & x.next_start_y.notna() & (x.next_posteam != x.posteam)]
+    g = x.groupby(['game_id', 'fixed_drive'])
     out = {}
-    for (o, yb), g in x.groupby(['result', 'yb']):
-        h = np.bincount(ybin_of(g.next_start_y.values), minlength=10).astype(float)
-        out[f'{o}|{yb}'] = [round(v, 5) for v in ((h + 0.5) / (h.sum() + 5)).tolist()]
+    for prefix, sub in [('', x), ('S:', x[g.cumcount() == 0]), ('E:', x[g.cumcount(ascending=False) == 0])]:
+        for (o, yb), grp in sub.groupby(['result', 'yb']):
+            h = np.bincount(ybin_of(grp.next_start_y.values), minlength=10).astype(float)
+            out[f'{prefix}{o}|{yb}'] = [round(v, 5) for v in ((h + 0.5) / (h.sum() + 5)).tolist()]
     return out
 
 

@@ -35,7 +35,8 @@ RESULT = {
 }
 COLS = ['game_id', 'id_play', 'game_play_number', 'season', 'week', 'season_type', 'home', 'away', 'home_team_division', 'away_team_division', 'pos_team', 'def_pos_team',
         'period', 'clock_minutes', 'clock_seconds', 'down', 'distance', 'yards_to_goal', 'play_type', 'drive_number', 'drive_result_detailed',
-        'pos_team_score', 'def_pos_team_score', 'pos_team_timeouts_rem_before', 'def_pos_team_timeouts_rem_before', 'spread', 'over_under', 'home_wp_before']
+        'pos_team_score', 'def_pos_team_score', 'pos_team_timeouts_rem_before', 'def_pos_team_timeouts_rem_before', 'spread', 'over_under', 'home_wp_before',
+        'yards_gained']
 
 
 def load(seasons):
@@ -82,6 +83,7 @@ def load(seasons):
         'posteam_timeouts_remaining': x.pos_team_timeouts_rem_before, 'defteam_timeouts_remaining': x.def_pos_team_timeouts_rem_before,
         'spread_line': -x.spread,          # CFBD: negative = home favoured; model/nflverse: positive = home favoured
         'total_line': x.over_under, 'vegas_home_wp': x.home_wp_before, 'play_id': np.arange(len(x)),
+        'yards_gained': x.yards_gained, 'play_type_raw': pt,
     })
     fin = d.groupby('game_id')[['total_home_score', 'total_away_score']].transform('last')
     d['home_score'], d['away_score'] = fin.total_home_score, fin.total_away_score
