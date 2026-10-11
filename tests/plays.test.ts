@@ -16,11 +16,12 @@ test('a 4th down draws 4th-down plays: kicks and punts, not ordinary snaps', () 
   assert.ok(punts2 / n > 0.7, `4th-and-8 at own 30 with 3:20 left: punt share ${(punts2 / n).toFixed(2)}`);
 });
 
-test('buzzer snaps logged at 0:00 are kept (field goals with seconds left)', () => {
+test('buzzer snaps are kept (field goals with seconds left) and end-of-half snaps run the clock out', () => {
+  // Snaps logged at 0:00 are kept; after de-staling they carry the last few seconds, so drawn at 0:04 most end the half.
   const r = rng(3); let fg = 0, ends = 0; const n = 4000;
-  for (let i = 0; i < n; i++) { const p = pm.sample(1, 4, 20, 2, 10, 0, 0, 1, r); if (p.ev === EV.FG_GOOD || p.ev === EV.FG_MISS) fg++; if (p.clock < 0) ends++; }
+  for (let i = 0; i < n; i++) { const p = pm.sample(1, 4, 20, 2, 10, 0, 0, 1, r); if (p.ev === EV.FG_GOOD || p.ev === EV.FG_MISS) fg++; if (p.clock < 0 || p.clock >= 4) ends++; }
   assert.ok(fg / n > 0.3, `ball at the 20 with 0:04 left: field goal share ${(fg / n).toFixed(2)}`);
-  assert.ok(ends > 0, 'some samples end the half (logged at 0:00)');
+  assert.ok(ends / n > 0.3, `share of snaps at 0:04 that end the half ${(ends / n).toFixed(2)}`);
 });
 
 test('play mode runs the end of the half snap by snap and consumes the clock', () => {
