@@ -76,11 +76,17 @@ def drive_frame(d):
                result=('fixed_drive_result', 'first'), home=('home_team', 'first'),
                end_home=('total_home_score', 'last'), end_away=('total_away_score', 'last')).reset_index()
     dr['result'] = dr.result.map(RESULT_MAP)
-    # Drive end time = start time of the next drive in the same half (0 if this was the half's last drive).
+    # Drive end time = the next drive's FIRST SNAP in the same half (0 if this was the half's last drive). Not the next drive's
+    # first row: after a score that is the kickoff, and the return between kickoff and first snap then belonged to no drive
+    # (~5-10 s per post-score possession, ~30 s a half), so simulated halves fitted in too many drives early.
     first = g.half_seconds_remaining.max().reset_index(name='start_hsr')
     dr = dr.merge(first, on=['game_id', 'fixed_drive'])
+    snaps = d[d.down.notna() & d.yardline_100.notna() & ~d.play_type.isin(['kickoff', 'extra_point'])]
+    snap = snaps.groupby(['game_id', 'fixed_drive']).half_seconds_remaining.max().reset_index(name='snap_hsr')
+    dr = dr.merge(snap, on=['game_id', 'fixed_drive'], how='left')
+    dr['snap_hsr'] = dr.snap_hsr.fillna(dr.start_hsr)
     nxt = dr.groupby('game_id').shift(-1)
-    dr['end_hsr'] = np.where(nxt.half == dr.half, nxt.start_hsr, 0.0)
+    dr['end_hsr'] = np.where(nxt.half == dr.half, nxt.snap_hsr, 0.0)
     # Points on the drive = score change from the previous drive's end (scores are post-play).
     prev = dr.groupby('game_id')[['end_home', 'end_away']].shift(1).fillna(0)
     dh, da = dr.end_home - prev.end_home, dr.end_away - prev.end_away
