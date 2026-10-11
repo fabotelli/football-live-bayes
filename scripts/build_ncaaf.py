@@ -132,6 +132,7 @@ def main():
         'duration': {**B.duration_table(s), **B.duration_table(s[s.groupby(['game_id', 'fixed_drive']).cumcount() == 0], 'S:')},
         'nextStart': B.next_start_table(s, dr),
         'kickoffStart': ko,
+        'endY': B.end_y_table(s),
         'tdPoints': B.td_points(dr),
         'ot': ot_table(d[d.season.isin(train)]),
         'meanPointsPerGame': round(float((g.home_score + g.away_score).mean()), 3),

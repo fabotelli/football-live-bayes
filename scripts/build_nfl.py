@@ -211,6 +211,16 @@ def next_start_table(s, dr):
     return out
 
 
+def end_y_table(s):
+    """Mean yards-to-goal of a drive's LAST snap, by (result, yards-to-goal bin of its first snap). Used when the engine interrupts a
+    drive-level drive at the hand-off to the end-of-half play sampler: the ball's spot at that moment is interpolated between the
+    drive's start and this typical end spot."""
+    g = s.groupby(['game_id', 'fixed_drive'])
+    d = pd.DataFrame({'result': g.result.first(), 'y0': g.y.first(), 'y1': g.y.last()})
+    d['yb'] = ybin_of(d.y0.values)
+    return {f'{o}|{yb}': round(float(x.y1.mean()), 1) for (o, yb), x in d.groupby(['result', 'yb']) if len(x) >= 20}
+
+
 def kickoff_table(dr):
     """Start-position distribution (10-yard bins) after a TD/FG kickoff, per season."""
     x = dr.copy()
@@ -335,6 +345,7 @@ def main():
         'duration': {**duration_table(s), **duration_table(s[s.groupby(['game_id', 'fixed_drive']).cumcount() == 0], 'S:')},
         'nextStart': next_start_table(s, dr),
         'kickoffStart': kickoff_table(dr_all),
+        'endY': end_y_table(s),
         'tdPoints': td_points(dr),
         'ot': ot_table(d[d.season.isin(train)], games),
         'meanPointsPerGame': round(float(games[(games.game_type == 'REG') & games.season.isin(train)].total.mean()), 3),

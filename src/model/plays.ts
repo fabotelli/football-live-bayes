@@ -10,28 +10,33 @@ const MIN_GROUP = 25;
 
 export interface PlaysJson {
   version: string; league: string; startSeconds: number;
-  buckets: { tbEdges: number[]; ybEdges: number[]; tgEdges: number[]; dfEdges: number[] };
-  events: string[]; nSamples: number; samples: number[];   // flat [event, gain, clock, offTimeoutUsed, defTimeoutUsed] * n
+  buckets: { tbEdges: number[]; ybEdges: number[]; tgEdges: number[]; dfEdges: number[]; tcEdges?: number[]; ycEdges?: number[] };
+  events: string[]; nSamples: number; fields?: number;
+  samples: number[];   // flat [event, gain, clock, offTimeoutUsed, defTimeoutUsed, automaticFirstDown, downDelta, turnoverOnDowns] * n
   levels: { fields: string[]; groups: Record<string, number[]> }[];
 }
-export interface Play { ev: number; gain: number; clock: number; offTO: number; defTO: number }
+export interface Play { ev: number; gain: number; clock: number; offTO: number; defTO: number; firstDown: boolean; downDelta: number; tod: boolean }
 
 const bucket = (edges: number[], x: number) => { let i = 0; while (i < edges.length && x > edges[i]) i++; return i; };
 
 export class PlayModel {
   readonly start: number;
   private s: Int32Array;
+  private F: number;
   private levels: { fields: string[]; groups: Map<string, { score: Int32Array; other: Int32Array; pScore: number }> }[];
   private b: PlaysJson['buckets'];
 
   constructor(j: PlaysJson) {
     this.start = j.startSeconds; this.b = j.buckets;
     this.s = Int32Array.from(j.samples);
+    this.F = j.fields ?? 5;
+    const F = this.F;
     this.levels = j.levels.map((lv) => {
       const groups = new Map<string, { score: Int32Array; other: Int32Array; pScore: number }>();
       for (const [k, ids] of Object.entries(lv.groups)) {
         if (ids.length < MIN_GROUP) continue;
-        const score = ids.filter((i) => this.s[i * 5] === EV.TD || this.s[i * 5] === EV.FG_GOOD), other = ids.filter((i) => !(this.s[i * 5] === EV.TD || this.s[i * 5] === EV.FG_GOOD));
+        const isScore = (i: number) => this.s[i * F] === EV.TD || this.s[i * F] === EV.FG_GOOD;
+        const score = ids.filter(isScore), other = ids.filter((i) => !isScore(i));
         groups.set(k, { score: Int32Array.from(score), other: Int32Array.from(other), pScore: score.length / ids.length });
       }
       return { fields: lv.fields, groups };
@@ -43,15 +48,17 @@ export class PlayModel {
     const v: Record<string, number> = {
       h: half, tb: bucket(this.b.tbEdges, t), yb: bucket(this.b.ybEdges, y), dn: Math.max(1, Math.min(4, down)),
       tg: bucket(this.b.tgEdges, Math.max(1, togo)), df: bucket(this.b.dfEdges, diff), to: Math.max(0, Math.min(2, offTimeouts)),
+      tc: bucket(this.b.tcEdges ?? [], t), yc: bucket(this.b.ycEdges ?? [], y),
     };
     for (const lv of this.levels) {
       const g = lv.groups.get(lv.fields.map((f) => v[f]).join('|'));
       if (!g) continue;
       const p = Math.min(0.95, tilt * g.pScore);
       const pool = (rand() < p && g.score.length) || !g.other.length ? g.score : g.other;
-      const i = pool[Math.floor(rand() * pool.length)] * 5;
-      return { ev: this.s[i], gain: this.s[i + 1], clock: this.s[i + 2], offTO: this.s[i + 3], defTO: this.s[i + 4] };
+      const i = pool[Math.floor(rand() * pool.length)] * this.F, s = this.s;
+      return { ev: s[i], gain: s[i + 1], clock: s[i + 2], offTO: s[i + 3], defTO: s[i + 4],
+        firstDown: this.F > 5 ? s[i + 5] === 1 : false, downDelta: this.F > 5 ? s[i + 6] : 1, tod: this.F > 5 ? s[i + 7] === 1 : false };
     }
-    return { ev: EV.PLAY, gain: 0, clock: Math.min(t, 30), offTO: 0, defTO: 0 };   // no group at all (cannot happen with shipped tables)
+    return { ev: EV.PLAY, gain: 0, clock: Math.min(t, 30), offTO: 0, defTO: 0, firstDown: false, downDelta: 1, tod: false };   // no group at all (cannot happen with shipped tables)
   }
 }

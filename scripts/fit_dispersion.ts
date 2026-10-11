@@ -9,24 +9,29 @@
 // Everything is simulated at the league's typical closing line with fixed seeds, so the search is deterministic.
 //   node scripts/fit_dispersion.ts --league ncaaf
 import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { DriveModel, mean, type GameState } from '../src/model/drive.ts';
+import { PlayModel } from '../src/model/plays.ts';
 
 const i = process.argv.indexOf('--league'); const LEAGUE = i > 0 ? process.argv[i + 1] : 'ncaaf';
 const path = new URL(`../data/models/${LEAGUE}_drive_v2.json`, import.meta.url).pathname;
 const json = JSON.parse(readFileSync(path, 'utf8'));
 const tg = json.targets; if (!tg?.totalSd) throw new Error('model has no dispersion targets; rebuild it');
+// With an end-of-half play table on disk the fit simulates with it, as the shadow loop and backtests do (--no-plays to skip).
+const playsPath = new URL(`../data/models/${LEAGUE}_plays_v1.json`, import.meta.url).pathname;
+const plays = existsSync(playsPath) && !process.argv.includes('--no-plays') ? new PlayModel(JSON.parse(readFileSync(playsPath, 'utf8'))) : null;
 const pr = tg.typicalPrior;
 const kickoff = (half: 1 | 2): GameState => ({ half, hsr: 1800, homeScore: 0, awayScore: 0, possHome: true, kickoff: true, y: 75, down: 1, togo: 10, homeTO: 3, awayTO: 3, recv2Home: half === 2 ? true : null });
 const sd = (d: Float64Array) => { const m = mean(d); let v = 0; for (let k = 0; k < d.length; k++) v += d[k] * (k - m) ** 2; return Math.sqrt(v); };
 
 let timeFactor: number[][] = [[1, 1, 1], [1, 1, 1]];
-function measure(k: number, alpha: number, full = false) {
-  const m = new DriveModel({ ...json, durationShrink: k, gameEnv: { alpha }, timeFactor });
+function measure(k: number, alpha: number, full = false, withPlays = true) {
+  const m = new DriveModel({ ...json, durationShrink: k, gameEnv: { alpha }, timeFactor }, undefined, withPlays ? plays : null);
   // Second half from a 0-0 kickoff with g from its prior: the unconditional second-half distribution at this line.
-  const h2 = m.simulate(kickoff(2), pr, { sims: 30000, seed: 777, env: 'prior' });
+  const h2 = m.simulate(kickoff(2), pr, { sims: 12000, seed: 777, env: 'prior' });
   const out = { k, alpha, drivesSd: h2.drives.sd, h2Sd: sd(h2.total), totalSd: NaN, meanMinusLine: NaN, slope: NaN };
   if (full) {
-    const g = m.simulate(kickoff(1), pr, { sims: 40000, seed: 778, openingCoinFlip: true, env: 'prior', pairs: true });
+    const g = m.simulate(kickoff(1), pr, { sims: 16000, seed: 778, openingCoinFlip: true, env: 'prior', pairs: true });
     out.totalSd = sd(g.total); out.meanMinusLine = mean(g.total) - pr.total;
     const { h1, h2: s2 } = g.pairs!; let m1 = 0, m2 = 0; for (let j = 0; j < h1.length; j++) { m1 += h1[j]; m2 += s2[j]; } m1 /= h1.length; m2 /= h1.length;
     let c = 0, v = 0; for (let j = 0; j < h1.length; j++) { c += (h1[j] - m1) * (s2[j] - m2); v += (h1[j] - m1) ** 2; }
@@ -36,9 +41,11 @@ function measure(k: number, alpha: number, full = false) {
 }
 
 function fitShrink(alpha: number): number {
-  if (measure(1, alpha).drivesSd <= tg.h2DrivesSd) return 1;     // only ever narrows
+  // Fitted on the drive-level engine alone: narrowing only applies to drive-level drives, and the play-sampled end of each half
+  // has its own (real) possession variance, so fitting with it attached drove k to its bound.
+  if (measure(1, alpha, false, false).drivesSd <= tg.h2DrivesSd) return 1;     // only ever narrows
   let lo = 0.2, hi = 1;
-  for (let it = 0; it < 12; it++) { const mid = (lo + hi) / 2; if (measure(mid, alpha).drivesSd > tg.h2DrivesSd) hi = mid; else lo = mid; }
+  for (let it = 0; it < 12; it++) { const mid = (lo + hi) / 2; if (measure(mid, alpha, false, false).drivesSd > tg.h2DrivesSd) hi = mid; else lo = mid; }
   return Math.round(((lo + hi) / 2) * 1000) / 1000;
 }
 
@@ -50,7 +57,7 @@ const k = fitShrink(0);
 // curve at the typical line (lambda recalibrates each round, so only the shape moves). Normalised to a points-weighted mean of 1.
 const BOUNDS = [0, 1500, 1680, 1800, 3300, 3480, 3600];   // elapsed seconds: window edges for >5:00, 5:00-2:00, last 2:00 per half
 const shares = () => {
-  const m = new DriveModel({ ...json, durationShrink: k, gameEnv: { alpha: 0 }, timeFactor });
+  const m = new DriveModel({ ...json, durationShrink: k, gameEnv: { alpha: 0 }, timeFactor }, undefined, plays);
   const E = BOUNDS.map((x) => m.expectedSoFar(pr, x));
   return E.slice(1).map((x, j) => (x - E[j]) / E[6]);
 };

@@ -18,6 +18,9 @@
 
 import { PlayModel, EV } from './plays.ts';
 
+// Expected-points curve resolution: 10 s bins over 60 minutes (1-minute bins blurred the end-of-half timing checks).
+const CURVE_STEP = 10, CURVE_N = 3600 / CURVE_STEP + 1;
+
 export const OUTCOMES = ['TD', 'FG', 'PUNT', 'TO', 'DOWNS', 'MISSFG', 'END', 'OPPTD', 'SAFETY'] as const;
 export type Outcome = typeof OUTCOMES[number];
 const [TD, FG, PUNT, TO, DOWNS, MISSFG, END, OPPTD, SAFETY] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -31,6 +34,7 @@ export interface DriveModelJson {
   duration: Record<string, number[] | null>;          // `${outcome}|${half|*}|${tb}|${zone|*}` (drive in progress) and `S:...` (drive start) -> quantiles of seconds (evenly spaced)
   nextStart: Record<string, number[]>;                // `${outcome}|${yb}` -> P(next start yard bin)
   kickoffStart: Record<string, number[]>;             // season -> P(start yard bin) after a kickoff
+  endY?: Record<string, number>;                      // `${outcome}|${start yb}` -> mean yards to goal of the drive's last snap
   tdPoints: Record<string, number>;                   // "6"/"7"/"8" -> prob
   ot: { pTie: number; winnerAdd: Record<string, number>; loserAdd: Record<string, number> };
   halfSeconds?: number;                               // 1800 for NFL and NCAAF
@@ -71,7 +75,7 @@ export interface SimOptions {
   sims?: number; seed?: number; lambda?: [number, number]; openingCoinFlip?: boolean;
   env?: EnvMode;       // posterior (default): update g from the score so far; prior: ignore the score (used for fitting); off: g = 1
   pairs?: boolean;     // collect per-path 1H/2H points
-  curve?: boolean;     // collect the expected cumulative points by elapsed minute (internal, used by lambdas)
+  curve?: boolean;     // collect the expected cumulative points by elapsed time, 10 s bins (internal, used by lambdas)
   stats?: boolean;     // collect drive-level diagnostics (outcome counts and mean start yards-to-goal, by half)
 }
 
@@ -125,7 +129,7 @@ export class DriveModel {
   private otWin: { v: number[]; p: number[] };
   private otLose: { v: number[]; p: number[] };
   private lamCache = new Map<string, [number, number]>();
-  private curveCache = new Map<string, Float64Array>();   // expected cumulative total points by elapsed minute (61 values)
+  private curveCache = new Map<string, Float64Array>();   // expected cumulative total points by elapsed CURVE_STEP seconds (361 values)
   /** Game-environment prior strength (0 = off) and points dispersion. Public so scripts/fit_dispersion.ts can search them. */
   envAlpha: number;
   pointsDisp: number;
@@ -251,7 +255,7 @@ export class DriveModel {
   expectedSoFar(prior: Prior, elapsed: number): number {
     this.lambdas(prior);
     const c = this.curveCache.get(`${prior.spread}|${prior.total}`)!;
-    const x = clamp(elapsed / 60, 0, c.length - 1), i = Math.floor(x), f = x - i;
+    const x = clamp(elapsed / CURVE_STEP, 0, c.length - 1), i = Math.floor(x), f = x - i;
     return i + 1 < c.length ? c[i] * (1 - f) + c[i + 1] * f : c[i];
   }
 
@@ -273,8 +277,8 @@ export class DriveModel {
         env.rate += this.expectedSoFar(prior, elapsed) / this.pointsDisp;
       }
     }
-    const curveBins = opt.curve ? new Float64Array(61) : null;
-    const dstats = opt.stats ? { n: [0, 0], y: [0, 0], o: [new Float64Array(K), new Float64Array(K)], nextY: new Float64Array(K), nextN: new Float64Array(K), win: Array.from({ length: 6 }, () => ({ n: 0, td: 0, fg: 0, y: 0, gap: 0 })) } : null;
+    const curveBins = opt.curve ? new Float64Array(CURVE_N) : null;
+    const dstats = opt.stats ? { n: [0, 0], y: [0, 0], o: [new Float64Array(K), new Float64Array(K)], nextY: new Float64Array(K), nextN: new Float64Array(K), win: Array.from({ length: 6 }, () => ({ n: 0, td: 0, fg: 0, y: 0, gap: 0 })), snaps: [0, 0], pts: [0, 0], entries: [0, 0], entryY: [0, 0], entryGap: [0, 0], entryDown1: [0, 0], pw: Array.from({ length: 4 }, () => ({ snaps: 0, td: 0, fg: 0, punt: 0, clock: 0, d1: 0, d2: 0, d3: 0, d4: 0, y: 0 })) } : null;
     const pairsH1 = opt.pairs ? new Int16Array(sims) : null, pairsH2 = opt.pairs ? new Int16Array(sims) : null;
     const MAXP = 120;
     const total = new Float64Array(2 * MAXP), home = new Float64Array(MAXP), away = new Float64Array(MAXP);
@@ -310,21 +314,25 @@ export class DriveModel {
         const diff = possHome ? h - a : a - h;
         // End of half: hand off to the play sampler (real end-of-half snaps carry the clock rules, timeouts, hurry-up and kneels).
         if (this.plays && t <= this.plays.start) {
+          if (dstats) { dstats.entries[half - 1]++; dstats.entryY[half - 1] += y; dstats.entryGap[half - 1] += Math.abs(h - a); if (down === 1) dstats.entryDown1[half - 1]++; }
+          const ptsIn = h + a;
           for (let snaps = 0; t > 0 && snaps < 400; snaps++) {
             const df = possHome ? h - a : a - h;
             const tilt = g * this.timeFactor[half - 1][t > 300 ? 0 : t > 120 ? 1 : 2] * (possHome ? lam[0] : lam[1]) / this.strength[this.cell(half, t, df, y, down, togo)];
             const pl = this.plays.sample(half, t, y, down, togo, df, possHome ? hTO : aTO, tilt, rand);
+            if (dstats) { dstats.snaps[half - 1]++; const w = dstats.pw[(half - 1) * 2 + (t > 120 ? 0 : 1)]; w.snaps++; w.clock += pl.clock; (w as any)["d" + down]++; w.y += y; if (pl.ev === EV.TD) w.td++; if (pl.ev === EV.FG_GOOD) w.fg++; if (pl.ev === EV.PUNT) w.punt++; }
             if (possHome) { hTO = Math.max(0, hTO - pl.offTO); aTO = Math.max(0, aTO - pl.defTO); } else { aTO = Math.max(0, aTO - pl.offTO); hTO = Math.max(0, hTO - pl.defTO); }
-            t -= pl.clock;
+            t = pl.clock < 0 ? 0 : t - pl.clock;   // clock -1: a snap logged at 0:00 (buzzer play); the half ends after it
             const before = h + a;
             let ev: number = pl.ev, flip = false;
             if (ev === EV.PLAY) {
-              y -= pl.gain;
-              if (y <= 0) ev = EV.TD;
-              else if (y >= 100) ev = EV.SAFETY;
-              else if (pl.gain >= togo) { down = 1; togo = Math.min(10, y); }
-              else if (down >= 4) { flip = true; y = clamp(100 - y, 1, 99); nd++; }          // turnover on downs at the spot
-              else { down++; togo -= pl.gain; }
+              // Series outcome comes from the sample (penalties replay downs or award first downs); the ball cannot cross the goal
+              // line on a play that did not score, so a long gain sampled from further out stops at the 1.
+              y = Math.max(1, y - pl.gain);
+              if (y >= 100) ev = EV.SAFETY;
+              else if (down >= 4 && !pl.firstDown && pl.gain < togo && pl.downDelta > 0) { flip = true; y = clamp(100 - y, 1, 99); nd++; }   // turnover on downs at the spot
+              else if (pl.gain >= togo || pl.firstDown) { down = 1; togo = Math.min(10, y); }   // firstDown = automatic (penalty) first down
+              else { down = clamp(down + pl.downDelta, 1, 4); togo = Math.max(1, togo - pl.gain); }
             }
             switch (ev) {
               case EV.TD: { const pts = this.tdPts.v[sampleDiscrete(this.tdPts.p, rand())]; if (possHome) h += pts; else a += pts; flip = true; y = this.startFrom(this.kick, rand(), rand()); nd++; break; }
@@ -337,8 +345,9 @@ export class DriveModel {
             }
             if (flip) possHome = !possHome;
             if (ev !== EV.PLAY || flip) { down = 1; togo = Math.min(10, y); }
-            if (curveBins && h + a > before) curveBins[clamp(Math.floor(((half - 1) * this.halfSeconds + this.halfSeconds - Math.max(t, 1)) / 60), 0, 59)] += h + a - before;
+            if (curveBins && h + a > before) curveBins[clamp(Math.floor(((half - 1) * this.halfSeconds + this.halfSeconds - Math.max(t, 1)) / CURVE_STEP), 0, CURVE_N - 2)] += h + a - before;
           }
+          if (dstats) dstats.pts[half - 1] += h + a - ptsIn;
           t = 0; first = false;
           continue;
         }
@@ -360,7 +369,18 @@ export class DriveModel {
         if (dstats && down === 1) { dstats.n[half - 1]++; dstats.y[half - 1] += y; dstats.o[half - 1][o]++; }
         if (dstats && down === 1) { const w = dstats.win[(half - 1) * 3 + (t > 300 ? 0 : t > 120 ? 1 : 2)]; w.n++; w.y += y; w.gap += Math.abs(diff); if (o === TD) w.td++; if (o === FG) w.fg++; }
         const fresh = !first || !!st.kickoff;   // a drive starting now (vs the live state's drive in progress)
-        t -= this.duration(o, half, t, y, fresh, rand());
+        const dur = this.duration(o, half, t, y, fresh, rand());
+        // Hand-off: a drive still running when the half reaches the play sampler's window is interrupted there. Its outcome is
+        // dropped (the play sampler decides it); the ball is placed between the drive's start and the typical end spot for that
+        // kind of drive, in proportion to the time elapsed. Without this the drive tables decided every drive that crossed 5:00.
+        if (this.plays && t > this.plays.start && t - dur < this.plays.start && dur > 0) {
+          const frac = (t - this.plays.start) / dur;
+          const yEnd = this.j.endY?.[`${OUTCOMES[o]}|${clamp(Math.floor((y - 1) / 10), 0, 9)}`] ?? y;
+          y = clamp(Math.round(y + (yEnd - y) * frac), 1, 99); down = 1; togo = Math.min(10, y);
+          t = this.plays.start; first = false;
+          continue;
+        }
+        t -= dur;
         const before = h + a;
         first = false;
         switch (o) {
@@ -375,7 +395,7 @@ export class DriveModel {
         down = 1; togo = Math.min(10, y);
         // Bin the points at the drive's end time; a drive whose clock ran past 0:00 scored at the end of ITS half (t >= 1 keeps it
         // in that half's last minute; clamping at 0 filed buzzer scores into the next half's first minute).
-        if (curveBins && h + a > before) curveBins[clamp(Math.floor(((half - 1) * this.halfSeconds + this.halfSeconds - Math.max(t, 1)) / 60), 0, 59)] += h + a - before;
+        if (curveBins && h + a > before) curveBins[clamp(Math.floor(((half - 1) * this.halfSeconds + this.halfSeconds - Math.max(t, 1)) / CURVE_STEP), 0, CURVE_N - 2)] += h + a - before;
       }
       if (pairsH1) { if (h1Pts === -1) h1Pts = h + a; pairsH1[s] = h1Pts; pairsH2![s] = h + a - h1Pts; }
       if (h1 && !h1Done) h1[Math.min(h + a, 2 * MAXP - 1)]++;
@@ -401,7 +421,7 @@ export class DriveModel {
       drives: { mean: dSum / sims, sd: Math.sqrt(Math.max(0, dSq / sims - (dSum / sims) ** 2)) }, env,
       ...(pairsH1 ? { pairs: { h1: pairsH1, h2: pairsH2! } } : {}),
       ...(dstats ? { stats: dstats } : {}),
-      ...(curveBins ? { curve: (() => { const c = new Float64Array(61); let acc = 0; for (let i = 0; i < 61; i++) { c[i] = acc; acc += curveBins[i] / sims; } return c; })() } : {}) };
+      ...(curveBins ? { curve: (() => { const c = new Float64Array(CURVE_N); let acc = 0; for (let i = 0; i < CURVE_N; i++) { c[i] = acc; acc += curveBins[i] / sims; } return c; })() } : {}) };
   }
 }
 
