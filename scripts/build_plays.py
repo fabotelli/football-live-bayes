@@ -76,10 +76,35 @@ def load(league, seasons):
     return s
 
 
+def destale(hsr):
+    """Spread stale clock readings. The college feed often logs several consecutive snaps with the same clock (2.1 per game in the
+    last 2:00 of the first half; 0.7 per half at 0:00 alone; NFL ~0.2). Taken literally, one snap uses 0 s and the next a lump;
+    the sampler draws snaps independently, so near 0:00 the lumps overshoot the time left, the half ends a snap or two early and
+    the spike-then-kick sequences are lost (the sampler ran ~5% short of snaps and ~18% short of field goals from real 2:00 states).
+    Each run of k equal readings T followed by the next reading Tn gets times T - (T - Tn) * j / k; a final run at 0:00 shares the
+    interval before it."""
+    v = np.asarray(hsr, dtype=float); n = len(v); out = v.copy()
+    runs = []; i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and v[j + 1] == v[i]: j += 1
+        runs.append((i, j)); i = j + 1
+    if len(runs) >= 2 and v[runs[-1][0]] == 0:          # trailing run at 0:00: merge into the run before it
+        a, _ = runs[-2]; b = runs[-1][1]; runs = runs[:-2] + [(a, b)]
+    for r, (a, b) in enumerate(runs):
+        k = b - a + 1
+        if k == 1: continue
+        T = v[a]; Tn = v[runs[r + 1][0]] if r + 1 < len(runs) else 0.0
+        out[a:b + 1] = T - (T - Tn) * np.arange(k) / k
+    return out
+
+
 def samples(s):
     s = s.copy()
     s['h'] = np.where(s.game_half == 'Half2', 2, 1)
     s['y'] = s.yardline_100.astype(int)
+    s['hsr_raw'] = s.half_seconds_remaining
+    s['half_seconds_remaining'] = s.groupby(['game_id', 'h'], sort=False).half_seconds_remaining.transform(lambda x: destale(x.values))
     g = s.groupby(['game_id', 'h'])
     for c in ['half_seconds_remaining', 'posteam', 'y', 'down', 'posteam_timeouts_remaining', 'defteam_timeouts_remaining']:
         s['n_' + c] = g[c].shift(-1)
@@ -103,8 +128,8 @@ def samples(s):
     # clock already at zero. Keep them, with clock -1 = "the half ends after this play" (dropping them lost a third of those kicks).
     # Only the half's real last snap ends it; an earlier 0:00 snap (an untimed down after a defensive penalty, a scoring play
     # with the PAT/kickoff still to come) takes 0 seconds and play goes on.
-    s.loc[(s.half_seconds_remaining == 0) & last, 'clock'] = -1
-    s.loc[(s.half_seconds_remaining == 0) & ~last, 'clock'] = 0
+    s.loc[(s.half_seconds_remaining <= 0) & last, 'clock'] = -1
+    s.loc[(s.half_seconds_remaining <= 0) & ~last, 'clock'] = 0
     s = s[(s.half_seconds_remaining <= START) & (s.half_seconds_remaining >= 0)]
     s['tb'] = np.searchsorted(TB_EDGES, s.half_seconds_remaining, side='left')
     s['tc'] = np.searchsorted(TC_EDGES, s.half_seconds_remaining, side='left')
