@@ -60,7 +60,8 @@ See `BACKTEST.md` for the latest numbers and how to read them.
   shadow log.
 - **Late game.** The model trails the benchmark in the last 5 minutes (clock strategy); the shadow loop blocks there by policy.
 - **NCAAF totals.** The v1 over-prediction was a play-ordering data bug (fixed). The too-wide distribution was fixed in v2.1
-  (drive-length outliers + fitted dispersion). Left: a small under-lean (mean ~0.5 points low), and Q4 with >5 min left slightly narrow.
+  (drive-length outliers + fitted dispersion). Left: an in-game under-lean of ~0.5-0.8 points in Q2-Q3 from mis-timed scoring around
+  the end of the first half (see BACKTEST.md, "Open"); pregame and Q4 are unbiased.
 - **NCAAF team codes.** ESPN → Kalshi college codes differ a lot; unmatched games log `NO_MARKET_MATCH` (never mis-priced).
   Needs a mapping table built from `KXNCAAFGAME` tickers (the old `ht_bot.NCAAFTickers` name-normalised fallback is a good model).
 - 1H team totals need per-team first-half distributions (not simulated yet); no live Bayesian update of λ from in-game

@@ -7,6 +7,25 @@ P(home wins) with the real result and with a benchmark WP, and check P(final tot
 **How to read it.** Matching or beating the benchmark says the state model is sound. It does **not** show a trading edge:
 Kalshi's live book is the real opponent, and no historical Kalshi prices were available here.
 
+## Open: NCAAF in-game under-lean (investigated 2026-10-11, NOT fixed)
+Game-weighted holdout test (one random state per game per phase, 1,031 games; per-game standard errors, because states within
+a game share one outcome and the play-weighted diagnostic overstates precision): model minus actual remaining points
+Q1 −0.44 ± 0.46, **Q2 −0.81 ± 0.37**, Q3 −0.47 ± 0.30, Q4 +0.02 ± 0.20. Pregame there is no lean (207 holdout games:
+model mean − line +0.37, actual +0.37).
+
+Where it comes from: **when** college points are scored, not how many. The model front-loads: real share of points by window
+(>5:00 / 5:00–2:00 / last 2:00, per half) is 37.6 / 4.8 / 9.0 | 39.2 / 4.8 / 4.6 %, the model's 38.8 / 5.9 / 8.1 | 37.3 / 5.1 / 4.8.
+From real first-half states with 2:00–5:00 left (1,127 training games): points before the 2:00 mark real 2.57 vs model 2.96,
+from 2:00 to halftime real 4.31 vs model 3.51. In-sample (training seasons) the second half is under-forecast from Q2 states by
+1.13 ± 0.30. The NFL's profile matches (35.9 / 5.5 / 9.8 | 37.5 / 5.6 / 5.7 vs real 35.7 / 4.7 / 10.4 | 37.4 / 6.4 / 5.4).
+Likely cause: college's end-of-half clock (stops on first downs inside 2:00) packs possessions and points into the last two
+minutes, which drive-level tables keyed on the clock at drive start only partly capture.
+
+Ruled out / fixed on the way: game-environment effect (added; fixes pregame width, moves the lean ~0.1); drive-length
+narrowing (not the cause); drive lengths by half (added, data-backed, little effect); evaluation weighting (explains part of the
+apparent lean in Q1/Q4, not Q2–Q3); a curve-binning bug that filed buzzer scores into the next half (fixed). Per-window scoring
+factors fit the shares but need ~0.5 / ~1.7 either side of 2:00, which would misprice red-zone states, so they are not used.
+
 ## Changes in v2.1: NCAAF totals distribution tightened
 College second halves were simulated with too few drives (10.2 vs 11.5 real) and too much spread in the count (sd 3.0 vs
 2.35), so each drive carried too many points and the remaining-total distribution was ~10% too wide before Q4.
