@@ -13,7 +13,7 @@ which is per-season because the kickoff rules changed in 2024 and 2025):
            divides each team's strength by the cell's r so team strength is not counted twice (the cause of the NCAAF late-game
            over-prediction in drive model v1)
   duration quantiles (2.5% steps, capped at p99, feed gaps > 10 min dropped) of the seconds the rest of the drive takes, by
-           (result, time bucket, field zone)
+           (result, half, time bucket, field zone)
   nextStart where the other team starts after a non-scoring drive end, by (result, yards-to-goal bin of the state)
   kickoff  start-position distribution after a score, per season
   tdPoints distribution of points on a touchdown drive (6/7/8)
@@ -173,11 +173,16 @@ def duration_table(s, prefix=''):
     them too short and fit too many drives into the game. States whose drive "lasts" over MAX_DRIVE_SECONDS are feed gaps and
     are left out."""
     s = s[s.rem <= MAX_DRIVE_SECONDS]
+    s = s.assign(h=np.where(s.game_half == 'Half2', 2, 1))
     out = {}
-    for (o, tb, z), g in s.groupby(['result', 'tb', 'zone']):
-        if len(g) >= 30: out[f'{prefix}{o}|{tb}|{z}'] = quantiles(g.rem)
-    for (o, tb), g in s.groupby(['result', 'tb']):          # fallback without field zone
-        out[f'{prefix}{o}|{tb}|*'] = quantiles(g.rem)
+    # Keyed by half too: first-half drives are quicker (offences race to halftime; college drives starting inside 2:00 take 53 s
+    # in the first half vs 66 s in the second, where leaders burn clock). Pooling the halves moved simulated scoring earlier.
+    for (o, h, tb, z), g in s.groupby(['result', 'h', 'tb', 'zone']):
+        if len(g) >= 30: out[f'{prefix}{o}|{h}|{tb}|{z}'] = quantiles(g.rem)
+    for (o, h, tb), g in s.groupby(['result', 'h', 'tb']):   # fallback without field zone
+        out[f'{prefix}{o}|{h}|{tb}|*'] = quantiles(g.rem)
+    for (o, tb), g in s.groupby(['result', 'tb']):           # fallback without half
+        out[f'{prefix}{o}|*|{tb}|*'] = quantiles(g.rem)
     return out
 
 
@@ -223,6 +228,26 @@ def ot_table(d, games):
             'loserAdd': {str(k): round(float(v), 4) for k, v in lose_add.value_counts(normalize=True).sort_index().items()}}
 
 
+WINDOWS = [(1800, 300), (300, 120), (120, 0)]   # half-seconds-remaining windows for the time profile: >5:00, 5:00-2:00, last 2:00
+
+
+def window_share(d, games):
+    """Share of regulation points scored in each half x window (6 values, half 1 first), over the given games. Scores are
+    post-play running totals, so points in a window = score at its end - score at its start."""
+    d = d[d.game_id.isin(set(games)) & d.game_half.isin(['Half1', 'Half2'])]
+    tot = d.total_home_score + d.total_away_score
+    d = d.assign(tot=tot)
+    out, prev = [], pd.Series(0.0, index=pd.Index(sorted(set(games))))
+    for half in ['Half1', 'Half2']:
+        h = d[d.game_half == half]
+        for _, end in WINDOWS:
+            x = h if end == 0 else h[h.half_seconds_remaining > end]
+            cur = x.groupby('game_id').tot.max().reindex(prev.index).fillna(prev).combine(prev, max)
+            out.append(float((cur - prev).mean())); prev = cur
+    s = sum(out)
+    return [round(v / s, 5) for v in out]
+
+
 def dispersion_targets(d, dr):
     """Real-data targets for scripts/fit_dispersion.ts (all from training seasons, regular season, games with a closing line):
       h2DrivesSd      SD of second-half drive counts per game
@@ -246,6 +271,7 @@ def dispersion_targets(d, dr):
             'totalSd': round(float((x.fin - x.tl).std()), 3), 'meanMinusLine': round(float((x.fin - x.tl).mean()), 3),
             'h1h2Slope': round(float(np.cov(e1, e2)[0, 1] / e1.var()), 4), 'nGames': int(len(x)),
             'pointsDisp': round(float((pts ** 2).mean() / pts.mean()), 3),
+            'windowShare': window_share(d, x.index),
             'typicalPrior': {'spread': round(float(x.sp.median()) * 2) / 2, 'total': round(float(x.tl.median()) * 2) / 2}}
 
 

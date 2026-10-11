@@ -26,15 +26,16 @@ export interface DriveModelJson {
   buckets: { tbEdges: number[]; gapEdges: number[]; togoEdges: number[]; zoneEdges: number[]; yBinWidth: number };
   outcome: number[][][][][][];                        // [tb][half x gap][yb][down-1][tg][outcome]
   strength: number[][][][][];                         // [tb][half x gap][yb][down-1][tg] mean pregame strength of the offenses in the cell
-  duration: Record<string, number[] | null>;          // `${outcome}|${tb}|${zone|*}` (drive in progress) and `S:...` (drive start) -> quantiles of seconds (evenly spaced)
+  duration: Record<string, number[] | null>;          // `${outcome}|${half|*}|${tb}|${zone|*}` (drive in progress) and `S:...` (drive start) -> quantiles of seconds (evenly spaced)
   nextStart: Record<string, number[]>;                // `${outcome}|${yb}` -> P(next start yard bin)
   kickoffStart: Record<string, number[]>;             // season -> P(start yard bin) after a kickoff
   tdPoints: Record<string, number>;                   // "6"/"7"/"8" -> prob
   ot: { pTie: number; winnerAdd: Record<string, number>; loserAdd: Record<string, number> };
   halfSeconds?: number;                               // 1800 for NFL and NCAAF
   durationShrink?: number;                            // drive-length dispersion factor, fitted by scripts/fit_dispersion.ts (1 = raw tables)
-  targets?: { h2DrivesSd: number; h2PointsSd: number; totalSd: number; meanMinusLine: number; h1h2Slope: number; pointsDisp: number; typicalPrior: Prior };
+  targets?: { h2DrivesSd: number; h2PointsSd: number; totalSd: number; meanMinusLine: number; h1h2Slope: number; pointsDisp: number; windowShare?: number[]; typicalPrior: Prior };
   gameEnv?: { alpha: number };                        // game-environment prior strength (0 = off), fitted by scripts/fit_dispersion.ts
+  timeFactor?: number[][];                            // [half-1][window] scoring factors (windows >5:00, 5:00-2:00, last 2:00), fitted
 }
 
 export interface GameState {
@@ -125,6 +126,10 @@ export class DriveModel {
   /** Game-environment prior strength (0 = off) and points dispersion. Public so scripts/fit_dispersion.ts can search them. */
   envAlpha: number;
   pointsDisp: number;
+  /** Scoring factor by [half-1][window]: >5:00 left, 5:00-2:00, last 2:00. Fitted (scripts/fit_dispersion.ts) so the share of points
+   *  scored in each window matches real games; without it the model front-loaded college scoring (~0.7 points too many in the
+   *  first half, too few at its end and in the second half), which showed up live as a ~0.5-point under-forecast of what is left. */
+  timeFactor: number[][];
   readonly halfSeconds: number;
 
   constructor(j: DriveModelJson, season?: number) {
@@ -139,6 +144,7 @@ export class DriveModel {
     this.durShrink = j.durationShrink ?? 1;
     this.envAlpha = j.gameEnv?.alpha ?? 0;
     this.pointsDisp = j.targets?.pointsDisp ?? 6.3;
+    this.timeFactor = j.timeFactor ?? [[1, 1, 1], [1, 1, 1]];
     for (const [k, p] of Object.entries(j.nextStart)) this.next.set(k, new Float64Array(p));
     const seasons = Object.keys(j.kickoffStart).map(Number).sort((a, b) => a - b);
     // Kickoff rules changed in 2024 and 2025: use the requested season's start distribution, else the latest season on file.
@@ -168,9 +174,9 @@ export class DriveModel {
   }
 
   /** Seconds the rest of the drive takes. `fresh` = the drive is just starting (simulated future drive), else in progress. */
-  private duration(o: number, hsr: number, y: number, fresh: boolean, u: number): number {
-    const b = this.j.buckets, tb = searchsortedLeft(b.tbEdges, hsr), zone = searchsortedLeft(b.zoneEdges, y), pre = fresh ? 'S:' : '';
-    const key = [`${pre}${OUTCOMES[o]}|${tb}|${zone}`, `${pre}${OUTCOMES[o]}|${tb}|*`, `${OUTCOMES[o]}|${tb}|*`].find((k) => this.dur.has(k));
+  private duration(o: number, half: number, hsr: number, y: number, fresh: boolean, u: number): number {
+    const b = this.j.buckets, tb = searchsortedLeft(b.tbEdges, hsr), zone = searchsortedLeft(b.zoneEdges, y), pre = fresh ? 'S:' : '', O = OUTCOMES[o];
+    const key = [`${pre}${O}|${half}|${tb}|${zone}`, `${pre}${O}|${half}|${tb}|*`, `${pre}${O}|*|${tb}|*`, `${O}|${half}|${tb}|*`, `${O}|*|${tb}|*`].find((k) => this.dur.has(k));
     if (!key) return 150;
     const q = this.dur.get(key)!;
     const x = u * (q.length - 1), i = Math.floor(x), f = x - i;
@@ -300,13 +306,13 @@ export class DriveModel {
         const base = this.probs.subarray(c * K, c * K + K);
         // Strength relative to the offenses this cell was fitted on: a 17-point leader's cell already reflects mostly strong teams,
         // so multiplying by the full lambda would count team strength twice (v1 over-predicted late NCAAF blowout scoring).
-        const l = g * (possHome ? lam[0] : lam[1]) / this.strength[c];
+        const l = g * this.timeFactor[half - 1][t > 300 ? 0 : t > 120 ? 1 : 2] * (possHome ? lam[0] : lam[1]) / this.strength[c];
         const score = base[TD] + base[FG], scaledScore = Math.min(0.98, l * score);
         const rest = (1 - scaledScore) / Math.max(1e-9, 1 - score);
         for (let i = 0; i < K; i++) p[i] = base[i] * rest;
         p[TD] = score > 0 ? base[TD] * scaledScore / score : 0; p[FG] = score > 0 ? base[FG] * scaledScore / score : 0;
         const o = sampleDiscrete(p, rand()); nd++;
-        t -= this.duration(o, t, y, !first || !!st.kickoff, rand());
+        t -= this.duration(o, half, t, y, !first || !!st.kickoff, rand());
         const before = h + a;
         first = false;
         switch (o) {
@@ -318,7 +324,9 @@ export class DriveModel {
           default: { const ny = this.nextStart(o, y, rand(), rand()); possHome = !possHome; y = ny; }
         }
         down = 1; togo = Math.min(10, y);
-        if (curveBins && h + a > before) curveBins[clamp(Math.floor(((half - 1) * this.halfSeconds + this.halfSeconds - Math.max(t, 0)) / 60), 0, 60)] += h + a - before;
+        // Bin the points at the drive's end time; a drive whose clock ran past 0:00 scored at the end of ITS half (t >= 1 keeps it
+        // in that half's last minute; clamping at 0 filed buzzer scores into the next half's first minute).
+        if (curveBins && h + a > before) curveBins[clamp(Math.floor(((half - 1) * this.halfSeconds + this.halfSeconds - Math.max(t, 1)) / 60), 0, 59)] += h + a - before;
       }
       if (pairsH1) { if (h1Pts === -1) h1Pts = h + a; pairsH1[s] = h1Pts; pairsH2![s] = h + a - h1Pts; }
       if (h1 && !h1Done) h1[Math.min(h + a, 2 * MAXP - 1)]++;
