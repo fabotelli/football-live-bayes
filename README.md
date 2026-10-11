@@ -35,6 +35,7 @@ This project applies the NHL live-Bayes approach (`nhl-live-bayes`) to football:
 | `scripts/backtest.ts` | holdout backtest vs real outcomes and vs the benchmark WP (nflverse `vegas_home_wp` / cfbfastR `home_wp_before`) |
 | `src/data/espn.ts` | ESPN scoreboard → `GameState` (fail closed on dead balls, kickoffs, missing field position, OT) |
 | `src/kalshi/gateway.ts` | read-only Kalshi market data, fee formula, series names (CONFIRMED vs to-be-confirmed) |
+| `src/signals/policy.ts` | per-market policy blocks for known model weaknesses (currently: NCAAF totals in Q2-Q3) |
 | `src/signals/fair.ts`, `src/signals/classify.ts` | market → fair P(YES); edge/fee/price-band/liquidity classification (NHL rule shape) |
 | `src/live/shadow.ts` | poll loop: ESPN + Kalshi → `runtime/state/signals-<ETdate>.jsonl` + `latest.json`. Never trades. |
 

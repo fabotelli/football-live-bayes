@@ -8,6 +8,7 @@ import { fetchScoreboard, parseEvent, type League, type ParsedGame } from '../da
 import { KalshiReadOnly, SERIES, CONFIRMED, kalshiDatePrefix, type Market } from '../kalshi/gateway.ts';
 import { fairYes } from '../signals/fair.ts';
 import { evalMarket, RULES, type GlobalBlock } from '../signals/classify.ts';
+import { marketBlock } from '../signals/policy.ts';
 
 const root = new URL('../..', import.meta.url).pathname;
 const arg = (k: string, d: string) => { const i = process.argv.indexOf('--' + k); return i > 0 ? process.argv[i + 1] : d; };
@@ -78,7 +79,8 @@ async function pollOnce(): Promise<void> {
       for (const mk of km.markets) {
         const f = sim ? fairYes(mk, sim, { homeK: km.homeK, awayK: km.awayK }) : null;
         if (sim && !f) continue;
-        const [yes, no] = evalMarket(f?.fair ?? 0.5, mk.yesAsk, mk.yesAskSize, mk.noAsk, block ?? (f ? null : { reason: 'unpriced' }));
+        const pol = !block && g.game ? marketBlock(lg, mk.series, g.game) : null;
+        const [yes, no] = evalMarket(f?.fair ?? 0.5, mk.yesAsk, mk.yesAskSize, mk.noAsk, block ?? (pol ? { reason: pol } : f ? null : { reason: 'unpriced' }));
         for (const e of [yes, no]) rows.push({ ts, league: lg, event: g.eventId, game: `${g.away}@${g.home}`, ticker: mk.ticker, series: mk.series,
           line: mk.line, team: mk.team, state: g.game, prior: m.prior, lambda: sim?.lambda, note: f?.note, ...e });
       }
